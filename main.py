@@ -332,8 +332,38 @@ class QCMApp(QWidget):
         f_report.addRow(self.btn_gen_report)
         gb_report.setLayout(f_report)
 
-        # --- D. 基础记录控制 ---
-        gb_ctrl = QGroupBox("4. Control")
+        # --- D. 沉积统计 ---
+        gb_stats = QGroupBox("4. Deposition Statistics")
+        f_stats = QFormLayout()
+
+        self.spin_ref_area = QDoubleSpinBox()
+        self.spin_ref_area.setRange(0.000001, 1000000.0)
+        self.spin_ref_area.setDecimals(4)
+        self.spin_ref_area.setValue(1.0)
+        self.spin_ref_area.setSuffix(" cm²")
+        self.spin_ref_area.setToolTip("参考样品/沉积区域面积；Total Mass (Ref) 和 ng/s 按此面积换算。")
+        self.spin_ref_area.valueChanged.connect(self.update_deposition_stats)
+
+        self.lbl_stat_time = QLabel("--")
+        self.lbl_stat_mass_density = QLabel("--")
+        self.lbl_stat_total_mass = QLabel("--")
+        self.lbl_stat_avg_rate_a = QLabel("--")
+        self.lbl_stat_avg_rate_ng = QLabel("--")
+        for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
+                    self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng]:
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setStyleSheet("background: #fafafa; border: 1px solid #ddd; padding: 3px;")
+
+        f_stats.addRow("Ref Area:", self.spin_ref_area)
+        f_stats.addRow("Time:", self.lbl_stat_time)
+        f_stats.addRow("Mass density @ QCM:", self.lbl_stat_mass_density)
+        f_stats.addRow("Total Mass (Ref):", self.lbl_stat_total_mass)
+        f_stats.addRow("Average rate (Å/s):", self.lbl_stat_avg_rate_a)
+        f_stats.addRow("Average rate (ng/s):", self.lbl_stat_avg_rate_ng)
+        gb_stats.setLayout(f_stats)
+
+        # --- E. 基础记录控制 ---
+        gb_ctrl = QGroupBox("5. Control")
         vb_ctrl = QVBoxLayout()
 
         self.chk_record = QCheckBox("Save QCM to CSV");
@@ -381,6 +411,7 @@ class QCMApp(QWidget):
         ctrl_panel.addWidget(gb_source);
         ctrl_panel.addWidget(gb_param)
         ctrl_panel.addWidget(gb_report);
+        ctrl_panel.addWidget(gb_stats);
         ctrl_panel.addWidget(gb_ctrl)  # [修改] 布局顺序
         ctrl_panel.addStretch()
 
@@ -580,6 +611,61 @@ class QCMApp(QWidget):
             return value
         return 10 ** value
 
+    @staticmethod
+    def format_duration(seconds):
+        if seconds is None or seconds <= 0:
+            return "0.000 s"
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours >= 1:
+            return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
+        if minutes >= 1:
+            return f"{int(minutes):02d}:{secs:06.3f}"
+        return f"{secs:.3f} s"
+
+    def calculate_deposition_stats(self):
+        if not self.time_data or not self.thick_data:
+            return None
+
+        elapsed_s = max(float(self.time_data[-1]), 0.0)
+        thickness_nm = float(self.thick_data[-1])
+        material = MATERIALS_DB.get(self.material_name, MATERIALS_DB["Default"])
+        density_g_cm3 = float(material["density"])
+        ref_area_cm2 = float(self.spin_ref_area.value())
+
+        # thickness [nm] -> cm, density [g/cm^3] -> areal mass [ng/cm^2]
+        mass_density_ng_cm2 = density_g_cm3 * thickness_nm * 100.0
+        total_mass_ng = mass_density_ng_cm2 * ref_area_cm2
+
+        if elapsed_s > 0:
+            avg_rate_a_s = thickness_nm * 10.0 / elapsed_s
+            avg_rate_ng_s = total_mass_ng / elapsed_s
+        else:
+            avg_rate_a_s = 0.0
+            avg_rate_ng_s = 0.0
+
+        return {
+            "elapsed_s": elapsed_s,
+            "mass_density_ng_cm2": mass_density_ng_cm2,
+            "total_mass_ng": total_mass_ng,
+            "avg_rate_a_s": avg_rate_a_s,
+            "avg_rate_ng_s": avg_rate_ng_s,
+        }
+
+    def update_deposition_stats(self, *_):
+        stats = self.calculate_deposition_stats()
+        if stats is None:
+            for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
+                        self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng]:
+                lbl.setText("--")
+            return
+
+        self.lbl_stat_time.setText(self.format_duration(stats["elapsed_s"]))
+        self.lbl_stat_mass_density.setText(f"{stats['mass_density_ng_cm2']:.6g} ng/cm²")
+        self.lbl_stat_total_mass.setText(f"{stats['total_mass_ng']:.6g} ng")
+        self.lbl_stat_avg_rate_a.setText(f"{stats['avg_rate_a_s']:.6g} Å/s")
+        self.lbl_stat_avg_rate_ng.setText(f"{stats['avg_rate_ng_s']:.6g} ng/s")
+
     def on_material_changed(self, name):
         self.material_name = name
         if not self.worker and len(self.freq_data) > 0: self.recalculate_all()
@@ -703,6 +789,7 @@ class QCMApp(QWidget):
             self.start_ts = None;
             self.last_smooth_rate = 0.0
             self.plot_dirty = False
+            self.update_deposition_stats()
 
             speed = self.spin_speed.value();
             save_csv = self.chk_record.isChecked();
@@ -759,6 +846,7 @@ class QCMApp(QWidget):
             if self.freq_data: self.plot_f.enableAutoRange(axis='y')
         self.curve_t.setData(x_data, list(self.thick_data))
         self.curve_r.setData(x_data, list(self.rate_data))
+        self.update_deposition_stats()
 
     def process_chunk(self, data_list):
         for data in data_list:
