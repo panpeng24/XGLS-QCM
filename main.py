@@ -3,6 +3,7 @@ import time
 import csv
 import os
 from datetime import datetime
+import math
 from collections import deque
 from bisect import bisect_left
 
@@ -121,7 +122,9 @@ class QCMWorker(QThread):
                 if not self.is_file_replay:
                     self.msleep(10)
                 else:
-                    if self.speed < 100: self.msleep(5)
+                    # Yield between replay chunks so the GUI event loop can repaint
+                    # instead of waiting for a click or for replay completion.
+                    self.msleep(10)
 
             except Exception as e:
                 self.error_signal.emit(str(e))
@@ -172,6 +175,7 @@ class QCMApp(QWidget):
         self.start_ts = None
         self.material_name = "Sn"
         self.last_smooth_rate = 0.0
+        self.plot_dirty = False
 
         # 数据容器
         MAX_LEN = 100000
@@ -187,7 +191,7 @@ class QCMApp(QWidget):
         self.plot_timer.timeout.connect(self.refresh_plots)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.setInterval(1000)
-        self.auto_refresh_timer.timeout.connect(self.refresh_plots)
+        self.auto_refresh_timer.timeout.connect(self.on_auto_refresh_tick)
 
         self.init_ui()
 
@@ -349,9 +353,9 @@ class QCMApp(QWidget):
         self.btn_save_img = QPushButton("Screenshot Graph");
         self.btn_save_img.clicked.connect(self.save_plots_as_image)
 
-        self.btn_auto_refresh = QPushButton("Auto Refresh: OFF (1s)")
+        self.btn_auto_refresh = QPushButton("Live Refresh: OFF (1s)")
         self.btn_auto_refresh.setCheckable(True)
-        self.btn_auto_refresh.setToolTip("每秒自动刷新曲线；文件回放模式下无需点击图表也会更新显示。")
+        self.btn_auto_refresh.setToolTip("每秒自动读取最新缓冲数据并刷新曲线；文件回放模式下无需点击图表也会更新显示。")
         self.btn_auto_refresh.toggled.connect(self.on_auto_refresh_toggled)
 
         self.btn_start = QPushButton("START");
@@ -494,13 +498,17 @@ class QCMApp(QWidget):
     def on_auto_refresh_toggled(self, checked):
         if checked:
             self.auto_refresh_timer.start()
-            self.btn_auto_refresh.setText("Auto Refresh: ON (1s)")
+            self.btn_auto_refresh.setText("Live Refresh: ON (1s)")
             self.btn_auto_refresh.setStyleSheet("background: #1565C0; color: white; padding: 6px; font-weight: bold;")
-            self.refresh_plots()
+            self.on_auto_refresh_tick(force=True)
         else:
             self.auto_refresh_timer.stop()
-            self.btn_auto_refresh.setText("Auto Refresh: OFF (1s)")
+            self.btn_auto_refresh.setText("Live Refresh: OFF (1s)")
             self.btn_auto_refresh.setStyleSheet("")
+
+    def on_auto_refresh_tick(self, force=False):
+        if force or self.plot_dirty:
+            self.refresh_plots()
 
     def get_crosshair_data(self, prefix):
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
@@ -516,27 +524,61 @@ class QCMApp(QWidget):
         return x_data, y_data, display_prefix
 
     @staticmethod
-    def nearest_point(x_data, y_data, x):
+    def value_at_x(x_data, y_data, x):
         if not x_data or not y_data:
             return x, None
+
         max_index = min(len(x_data), len(y_data)) - 1
         idx = bisect_left(x_data, x)
         if idx <= 0:
-            nearest_idx = 0
-        elif idx > max_index:
-            nearest_idx = max_index
-        else:
-            prev_idx = idx - 1
-            nearest_idx = idx if abs(x_data[idx] - x) < abs(x_data[prev_idx] - x) else prev_idx
-        return x_data[nearest_idx], y_data[nearest_idx]
+            return x_data[0], y_data[0]
+        if idx > max_index:
+            return x_data[max_index], y_data[max_index]
+
+        x0 = x_data[idx - 1]
+        x1 = x_data[idx]
+        y0 = y_data[idx - 1]
+        y1 = y_data[idx]
+        if x1 == x0:
+            return x1, y1
+
+        ratio = (x - x0) / (x1 - x0)
+        return x, y0 + ratio * (y1 - y0)
 
     @staticmethod
     def format_crosshair_value(value, suffix):
         if value is None:
             return "--"
+        if not math.isfinite(value):
+            return str(value)
         if suffix == "Hz":
-            return f"{value:.6f}"
-        return f"{value:.6g}"
+            return f"{value:.9f}"
+        if suffix == "nm":
+            return f"{value:.9f}"
+        if suffix == "Å/s":
+            return f"{value:.9f}"
+        return f"{value:.9g}"
+
+    @staticmethod
+    def is_plot_log_y(plot):
+        try:
+            return bool(plot.plotItem.ctrl.logYCheck.isChecked())
+        except AttributeError:
+            return False
+
+    @staticmethod
+    def data_y_to_view_y(value, is_log_y):
+        if not is_log_y:
+            return value
+        if value is None or value <= 0:
+            return None
+        return math.log10(value)
+
+    @staticmethod
+    def view_y_to_data_y(value, is_log_y):
+        if not is_log_y:
+            return value
+        return 10 ** value
 
     def on_material_changed(self, name):
         self.material_name = name
@@ -596,22 +638,26 @@ class QCMApp(QWidget):
                 mouse_point = plot.plotItem.vb.mapSceneToView(pos)
                 mouse_x = mouse_point.x()
                 x_data, y_data, display_prefix = self.get_crosshair_data(prefix)
-                x, y = self.nearest_point(x_data, y_data, mouse_x)
-                if y is None:
-                    y = mouse_point.y()
+                is_log_y = self.is_plot_log_y(plot)
+                x, data_y = self.value_at_x(x_data, y_data, mouse_x)
+                if data_y is None:
+                    data_y = self.view_y_to_data_y(mouse_point.y(), is_log_y)
+                view_y = self.data_y_to_view_y(data_y, is_log_y)
+                if view_y is None:
+                    view_y = mouse_point.y()
 
                 v_line.setPos(x)
-                h_line.setPos(y)
+                h_line.setPos(view_y)
                 if self.chk_abs_time.isChecked():
                     try:
                         t_str = datetime.fromtimestamp(x).strftime("%H:%M:%S.%f")[:-3]
                     except:
                         t_str = "Inv"
                 else:
-                    t_str = f"{x:.3f}s"
-                value_str = self.format_crosshair_value(y, suffix)
+                    t_str = f"{x:.6f}s"
+                value_str = self.format_crosshair_value(data_y, suffix)
                 label.setText(f"Time: {t_str}\n{display_prefix}: {value_str} {suffix}")
-                label.setPos(x, y)
+                label.setPos(x, view_y)
                 v_line.show()
                 h_line.show()
                 label.show()
@@ -656,6 +702,7 @@ class QCMApp(QWidget):
             self.f0 = None;
             self.start_ts = None;
             self.last_smooth_rate = 0.0
+            self.plot_dirty = False
 
             speed = self.spin_speed.value();
             save_csv = self.chk_record.isChecked();
@@ -668,6 +715,8 @@ class QCMApp(QWidget):
             self.worker.log_path_signal.connect(self.on_log_path_received)
             self.worker.start();
             self.plot_timer.start()
+            if src_id == 2 and not self.btn_auto_refresh.isChecked():
+                self.btn_auto_refresh.setChecked(True)
             self.btn_start.setEnabled(False);
             self.btn_stop.setEnabled(True);
             self.lbl_status.setText("RUNNING");
@@ -700,6 +749,7 @@ class QCMApp(QWidget):
 
     def refresh_plots(self):
         if not self.time_data: return
+        self.plot_dirty = False
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
         if self.chk_raw_freq.isChecked():
             self.curve_f.setData(x_data, list(self.raw_freq_data))
@@ -733,6 +783,10 @@ class QCMApp(QWidget):
                 smooth_rate = alpha * raw_rate + (1 - alpha) * self.last_smooth_rate
             self.last_smooth_rate = smooth_rate
             self.rate_data.append(smooth_rate)
+
+        self.plot_dirty = True
+        if not self.btn_auto_refresh.isChecked():
+            self.refresh_plots()
 
         if len(self.freq_data) > 60:
             if qcm_calc.is_steady_state(list(self.freq_data)[-60:], list(self.time_data)[-60:], 1.0):
