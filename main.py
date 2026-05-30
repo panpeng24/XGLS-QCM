@@ -4,6 +4,7 @@ import csv
 import os
 from datetime import datetime
 from collections import deque
+from bisect import bisect_left
 
 import pandas as pd  # 用于读取 RGA 数据
 
@@ -184,6 +185,9 @@ class QCMApp(QWidget):
         self.plot_timer = QTimer()
         self.plot_timer.setInterval(33)
         self.plot_timer.timeout.connect(self.refresh_plots)
+        self.auto_refresh_timer = QTimer()
+        self.auto_refresh_timer.setInterval(1000)
+        self.auto_refresh_timer.timeout.connect(self.refresh_plots)
 
         self.init_ui()
 
@@ -345,6 +349,11 @@ class QCMApp(QWidget):
         self.btn_save_img = QPushButton("Screenshot Graph");
         self.btn_save_img.clicked.connect(self.save_plots_as_image)
 
+        self.btn_auto_refresh = QPushButton("Auto Refresh: OFF (1s)")
+        self.btn_auto_refresh.setCheckable(True)
+        self.btn_auto_refresh.setToolTip("每秒自动刷新曲线；文件回放模式下无需点击图表也会更新显示。")
+        self.btn_auto_refresh.toggled.connect(self.on_auto_refresh_toggled)
+
         self.btn_start = QPushButton("START");
         self.btn_start.setStyleSheet("background: #2e7d32; color: white; padding: 10px; font-weight: bold;")
         self.btn_start.clicked.connect(self.start_experiment)
@@ -359,6 +368,7 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.chk_record);
         vb_ctrl.addWidget(self.widget_csv_path)
         vb_ctrl.addWidget(self.btn_save_img)
+        vb_ctrl.addWidget(self.btn_auto_refresh)
         vb_ctrl.addWidget(self.btn_start);
         vb_ctrl.addWidget(self.btn_stop);
         vb_ctrl.addWidget(self.lbl_status)
@@ -481,6 +491,53 @@ class QCMApp(QWidget):
             self.lbl_status.setText("Report Failed")
             QMessageBox.critical(self, "Error", msg)
 
+    def on_auto_refresh_toggled(self, checked):
+        if checked:
+            self.auto_refresh_timer.start()
+            self.btn_auto_refresh.setText("Auto Refresh: ON (1s)")
+            self.btn_auto_refresh.setStyleSheet("background: #1565C0; color: white; padding: 6px; font-weight: bold;")
+            self.refresh_plots()
+        else:
+            self.auto_refresh_timer.stop()
+            self.btn_auto_refresh.setText("Auto Refresh: OFF (1s)")
+            self.btn_auto_refresh.setStyleSheet("")
+
+    def get_crosshair_data(self, prefix):
+        x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        if prefix == "Freq":
+            y_data = list(self.raw_freq_data) if self.chk_raw_freq.isChecked() else list(self.freq_data)
+            display_prefix = "Raw" if self.chk_raw_freq.isChecked() else "Freq"
+        elif prefix == "Thk":
+            y_data = list(self.thick_data)
+            display_prefix = "Thk"
+        else:
+            y_data = list(self.rate_data)
+            display_prefix = "Rate"
+        return x_data, y_data, display_prefix
+
+    @staticmethod
+    def nearest_point(x_data, y_data, x):
+        if not x_data or not y_data:
+            return x, None
+        max_index = min(len(x_data), len(y_data)) - 1
+        idx = bisect_left(x_data, x)
+        if idx <= 0:
+            nearest_idx = 0
+        elif idx > max_index:
+            nearest_idx = max_index
+        else:
+            prev_idx = idx - 1
+            nearest_idx = idx if abs(x_data[idx] - x) < abs(x_data[prev_idx] - x) else prev_idx
+        return x_data[nearest_idx], y_data[nearest_idx]
+
+    @staticmethod
+    def format_crosshair_value(value, suffix):
+        if value is None:
+            return "--"
+        if suffix == "Hz":
+            return f"{value:.6f}"
+        return f"{value:.6g}"
+
     def on_material_changed(self, name):
         self.material_name = name
         if not self.worker and len(self.freq_data) > 0: self.recalculate_all()
@@ -536,23 +593,27 @@ class QCMApp(QWidget):
         def mouse_moved(evt):
             pos = evt[0]
             if plot.sceneBoundingRect().contains(pos):
-                mouse_point = plot.plotItem.vb.mapSceneToView(pos);
-                x, y = mouse_point.x(), mouse_point.y()
-                v_line.setPos(x);
+                mouse_point = plot.plotItem.vb.mapSceneToView(pos)
+                mouse_x = mouse_point.x()
+                x_data, y_data, display_prefix = self.get_crosshair_data(prefix)
+                x, y = self.nearest_point(x_data, y_data, mouse_x)
+                if y is None:
+                    y = mouse_point.y()
+
+                v_line.setPos(x)
                 h_line.setPos(y)
                 if self.chk_abs_time.isChecked():
                     try:
-                        t_str = datetime.fromtimestamp(x).strftime("%H:%M:%S")
+                        t_str = datetime.fromtimestamp(x).strftime("%H:%M:%S.%f")[:-3]
                     except:
                         t_str = "Inv"
                 else:
-                    t_str = f"{x:.1f}s"
-                display_prefix = prefix
-                if prefix == "Freq" and self.chk_raw_freq.isChecked(): display_prefix = "Raw"
-                label.setText(f"Time: {t_str}\n{display_prefix}: {y:.2f} {suffix}");
+                    t_str = f"{x:.3f}s"
+                value_str = self.format_crosshair_value(y, suffix)
+                label.setText(f"Time: {t_str}\n{display_prefix}: {value_str} {suffix}")
                 label.setPos(x, y)
-                v_line.show();
-                h_line.show();
+                v_line.show()
+                h_line.show()
                 label.show()
 
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)

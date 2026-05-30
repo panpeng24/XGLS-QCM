@@ -62,11 +62,13 @@ class QCMCalculator:
 
         return calibrated_thickness_cm * 1e7  # cm -> nm
 
-    def calc_rate(self, time_arr: Union[List, np.ndarray], thickness_arr: Union[List, np.ndarray]) -> float:
+    def calc_rate(self, time_arr: Union[List, np.ndarray], thickness_arr: Union[List, np.ndarray],
+                  window: int = 10) -> float:
         """
-        基于线性拟合计算沉积速率 (nm/min)
+        基于线性拟合计算沉积速率 (Å/s)。
+        :param window: 使用最后多少个点计算瞬时速率。
         """
-        window = 10  # 使用最后10个点计算瞬时速率
+        window = max(2, int(window))
         if len(time_arr) < 2:
             return 0.0
 
