@@ -176,6 +176,7 @@ class QCMApp(QWidget):
         self.material_name = "Sn"
         self.last_smooth_rate = 0.0
         self.plot_dirty = False
+        self.last_plot_refresh_time = 0.0
 
         # 数据容器
         MAX_LEN = 100000
@@ -528,6 +529,7 @@ class QCMApp(QWidget):
 
     def on_auto_refresh_toggled(self, checked):
         if checked:
+            self.last_plot_refresh_time = 0.0
             self.auto_refresh_timer.start()
             self.btn_auto_refresh.setText("Live Refresh: ON (1s)")
             self.btn_auto_refresh.setStyleSheet("background: #1565C0; color: white; padding: 6px; font-weight: bold;")
@@ -540,6 +542,7 @@ class QCMApp(QWidget):
     def on_auto_refresh_tick(self, force=False):
         if force or self.plot_dirty:
             self.refresh_plots()
+            self.last_plot_refresh_time = time.monotonic()
 
     def get_crosshair_data(self, prefix):
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
@@ -789,6 +792,7 @@ class QCMApp(QWidget):
             self.start_ts = None;
             self.last_smooth_rate = 0.0
             self.plot_dirty = False
+            self.last_plot_refresh_time = 0.0
             self.update_deposition_stats()
 
             speed = self.spin_speed.value();
@@ -873,7 +877,13 @@ class QCMApp(QWidget):
             self.rate_data.append(smooth_rate)
 
         self.plot_dirty = True
-        if not self.btn_auto_refresh.isChecked():
+        if self.btn_auto_refresh.isChecked():
+            current_time = time.monotonic()
+            if current_time - self.last_plot_refresh_time >= 1.0:
+                self.refresh_plots()
+                self.last_plot_refresh_time = current_time
+                QApplication.processEvents()
+        else:
             self.refresh_plots()
 
         if len(self.freq_data) > 60:
