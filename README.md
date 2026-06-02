@@ -76,3 +76,27 @@ MATERIALS_DB	dict	材料密度数据库，key 为材料简称，value 包含密�
 Tooling Factor 校准：需根据实际镀膜工艺校准（实际厚度 / 监测厚度），是提升厚度计算精度的关键；
 碳膜密度：蒸发碳膜密度通常在 1.8-2.25 g/cm³ 之间，默认取石墨标准值 2.25，可根据实验需求调整；
 稳态判断阈值：需根据具体工艺场景调整（如高精度镀膜可设为 0.5 Hz/min，粗镀膜可设为 2.0 Hz/min）。
+
+## Troubleshooting: `SyntaxError` on a line starting with `@@`
+
+If Python reports an error like:
+
+```text
+SyntaxError: invalid syntax
+@@ -99,117 +100,120 @@ class QCMWorker(QThread):
+```
+
+then a unified-diff patch hunk was copied into `main.py` as plain text. Lines that
+start with `@@`, `diff --git`, `<<<<<<<`, `=======`, or `>>>>>>>` are not Python
+code and must not appear in the source file.
+
+To check the repository copy before running the GUI:
+
+```bash
+python tools/check_source_integrity.py
+python -m py_compile main.py
+```
+
+If the check reports a marker, replace the affected file with the clean version
+from this repository (or apply the patch with `git apply`/`git pull` instead of
+copy-pasting the diff into `main.py`).
