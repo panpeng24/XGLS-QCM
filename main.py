@@ -173,7 +173,7 @@ class QCMApp(QWidget):
         self.ds = None
         self.f0 = None
         self.start_ts = None
-        self.material_name = "Sn"
+        self.material_name = "InSn"
         self.last_smooth_rate = 0.0
         self.plot_dirty = False
         self.last_plot_refresh_time = 0.0
@@ -189,6 +189,9 @@ class QCMApp(QWidget):
         self.raw_freq_data = deque(maxlen=MAX_LEN)  # Raw
         self.thick_data = deque(maxlen=MAX_LEN)
         self.rate_data = deque(maxlen=MAX_LEN)
+        self.epd_time_data = []
+        self.epd_current_data = []
+        self.epd_time_is_absolute = False
 
         self.plot_timer = QTimer()
         self.plot_timer.setInterval(33)
@@ -250,7 +253,7 @@ class QCMApp(QWidget):
         f_param = QFormLayout()
         self.combo_mat = QComboBox();
         self.combo_mat.addItems(MATERIALS_DB.keys());
-        self.combo_mat.setCurrentText("Sn")
+        self.combo_mat.setCurrentText("InSn")
         self.combo_mat.currentTextChanged.connect(self.on_material_changed)
 
         self.widget_tooling_container = QWidget()
@@ -305,6 +308,7 @@ class QCMApp(QWidget):
         # 平台选择 (Section 1)
         self.combo_platform = QComboBox()
         self.combo_platform.addItems(["DPP (Discharge)", "LRP (Laser)", "LDP (Hybrid)"])
+        self.combo_platform.setCurrentText("LRP (Laser)")
         self.combo_platform.setToolTip("选择光源平台类型 (Section 1)")
 
         # 台阶仪校准 (Section 11)
@@ -355,9 +359,20 @@ class QCMApp(QWidget):
         self.lbl_stat_avg_rate_ng = QLabel("--")
         self.lbl_rate_region_mean = QLabel("--")
         self.lbl_rate_region_std = QLabel("--")
+        self.lbl_epd_decay = QLabel("--")
+        self.widget_epd_path = QWidget()
+        layout_epd = QHBoxLayout(self.widget_epd_path)
+        layout_epd.setContentsMargins(0, 0, 0, 0)
+        self.input_epd_path = QLineEdit()
+        self.input_epd_path.setPlaceholderText("EPD CSV: time,current_nA")
+        self.btn_epd_browse = QPushButton("...")
+        self.btn_epd_browse.setFixedWidth(30)
+        self.btn_epd_browse.clicked.connect(self.select_epd_file)
+        layout_epd.addWidget(self.input_epd_path)
+        layout_epd.addWidget(self.btn_epd_browse)
         for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
                     self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
-                    self.lbl_rate_region_mean, self.lbl_rate_region_std]:
+                    self.lbl_rate_region_mean, self.lbl_rate_region_std, self.lbl_epd_decay]:
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setStyleSheet("background: #fafafa; border: 1px solid #ddd; padding: 3px;")
 
@@ -367,8 +382,10 @@ class QCMApp(QWidget):
         f_stats.addRow("Total Mass (Ref):", self.lbl_stat_total_mass)
         f_stats.addRow("Average rate (Å/s):", self.lbl_stat_avg_rate_a)
         f_stats.addRow("Average rate (ng/s):", self.lbl_stat_avg_rate_ng)
+        f_stats.addRow("EPD Data:", self.widget_epd_path)
         f_stats.addRow("Rate ROI mean:", self.lbl_rate_region_mean)
         f_stats.addRow("Rate ROI std:", self.lbl_rate_region_std)
+        f_stats.addRow("EPD decay:", self.lbl_epd_decay)
         gb_stats.setLayout(f_stats)
 
         # --- E. 基础记录控制 ---
@@ -453,6 +470,19 @@ class QCMApp(QWidget):
         self.curve_f = self.plot_f.plot(pen=pg.mkPen('k', width=2))
         self.curve_t = self.plot_t.plot(pen=pg.mkPen('r', width=2))
         self.curve_r = self.plot_r.plot(pen=pg.mkPen('b', width=2))
+        self.plot_r.plotItem.showAxis('right')
+        self.epd_axis = self.plot_r.plotItem.getAxis('right')
+        self.epd_axis.setLabel('EPD', units='nA')
+        self.epd_axis.setPen(pg.mkPen('g'))
+        self.epd_axis.show()
+        self.epd_view = pg.ViewBox()
+        self.plot_r.plotItem.scene().addItem(self.epd_view)
+        self.epd_axis.linkToView(self.epd_view)
+        self.epd_view.setXLink(self.plot_r)
+        self.curve_epd = pg.PlotDataItem(pen=pg.mkPen('g', width=2))
+        self.epd_view.addItem(self.curve_epd)
+        self.plot_r.plotItem.vb.sigResized.connect(self.update_epd_view_geometry)
+        self.update_epd_view_geometry()
         self.rate_region = pg.LinearRegionItem([0, 10], brush=pg.mkBrush(33, 150, 243, 40))
         self.rate_region.setZValue(10)
         self.rate_region.sigRegionChanged.connect(self.update_rate_region_stats)
@@ -481,6 +511,12 @@ class QCMApp(QWidget):
     def select_rga_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select RGA CSV", "", "CSV Files (*.csv);;All (*)")
         if fname: self.input_rga_path.setText(fname)
+
+    def select_epd_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select EPD CSV", "", "CSV Files (*.csv);;All (*)")
+        if fname:
+            self.input_epd_path.setText(fname)
+            self.load_epd_csv(fname)
 
     # [新增] 报告生成逻辑
     def generate_full_report(self):
@@ -675,7 +711,7 @@ class QCMApp(QWidget):
         if stats is None:
             for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
                         self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
-                        self.lbl_rate_region_mean, self.lbl_rate_region_std]:
+                        self.lbl_rate_region_mean, self.lbl_rate_region_std, self.lbl_epd_decay]:
                 lbl.setText("--")
             return
 
@@ -696,11 +732,83 @@ class QCMApp(QWidget):
         self.rate_region.setRegion([x0, x1])
         self.rate_region_initialized = True
 
+    def update_epd_view_geometry(self):
+        if hasattr(self, 'epd_view'):
+            self.epd_view.setGeometry(self.plot_r.plotItem.vb.sceneBoundingRect())
+            self.epd_view.linkedViewChanged(self.plot_r.plotItem.vb, self.epd_view.XAxis)
+
+    @staticmethod
+    def parse_epd_time(value):
+        text = str(value).strip()
+        try:
+            numeric = float(text)
+            return numeric, numeric > 1_000_000_000
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).timestamp(), True
+            except ValueError:
+                continue
+        parsed = pd.to_datetime(text, errors='raise')
+        return parsed.timestamp(), True
+
+    def load_epd_csv(self, path):
+        times = []
+        currents = []
+        time_is_absolute = False
+        try:
+            with open(path, 'r', encoding='utf-8-sig', errors='ignore', newline='') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    try:
+                        t, is_abs = self.parse_epd_time(row[0])
+                        current = float(str(row[1]).strip())
+                    except Exception:
+                        continue
+                    times.append(t)
+                    currents.append(current)
+                    time_is_absolute = time_is_absolute or is_abs
+            if not times:
+                raise ValueError("No valid rows found. Expected CSV columns: time,current_nA")
+            combined = sorted(zip(times, currents), key=lambda item: item[0])
+            self.epd_time_data = [item[0] for item in combined]
+            self.epd_current_data = [item[1] for item in combined]
+            self.epd_time_is_absolute = time_is_absolute
+            self.refresh_plots()
+            self.lbl_status.setText(f"EPD Loaded: {len(self.epd_time_data)} pts")
+        except Exception as e:
+            QMessageBox.warning(self, "EPD Error", f"无法读取 EPD CSV 文件: {e}")
+
+    def get_epd_plot_data(self):
+        if not self.epd_time_data:
+            return [], []
+        if self.chk_abs_time.isChecked():
+            if self.epd_time_is_absolute:
+                return self.epd_time_data, self.epd_current_data
+            if self.start_ts is not None:
+                return [self.start_ts + t for t in self.epd_time_data], self.epd_current_data
+            return self.epd_time_data, self.epd_current_data
+        if self.epd_time_is_absolute:
+            base = self.start_ts if self.start_ts is not None else self.epd_time_data[0]
+            return [t - base for t in self.epd_time_data], self.epd_current_data
+        return self.epd_time_data, self.epd_current_data
+
+    def update_epd_plot(self):
+        if not hasattr(self, 'curve_epd'):
+            return
+        x_epd, y_epd = self.get_epd_plot_data()
+        self.curve_epd.setData(x_epd, y_epd)
+        self.update_epd_view_geometry()
+
     def update_rate_region_stats(self):
         if not hasattr(self, 'rate_region') or not self.time_data or not self.rate_data:
             if hasattr(self, 'lbl_rate_region_mean'):
                 self.lbl_rate_region_mean.setText("--")
                 self.lbl_rate_region_std.setText("--")
+                self.lbl_epd_decay.setText("--")
             return
         start, end = self.rate_region.getRegion()
         if start > end:
@@ -710,6 +818,7 @@ class QCMApp(QWidget):
         if not rates:
             self.lbl_rate_region_mean.setText("--")
             self.lbl_rate_region_std.setText("--")
+            self.update_epd_decay_stats(start, end)
             return
         mean = sum(rates) / len(rates)
         if len(rates) > 1:
@@ -719,6 +828,22 @@ class QCMApp(QWidget):
             std = 0.0
         self.lbl_rate_region_mean.setText(f"{mean:.6g} Å/s (n={len(rates)})")
         self.lbl_rate_region_std.setText(f"{std:.6g} Å/s")
+        self.update_epd_decay_stats(start, end)
+
+    def update_epd_decay_stats(self, start, end):
+        x_epd, y_epd = self.get_epd_plot_data()
+        selected = [(x, y) for x, y in zip(x_epd, y_epd) if start <= x <= end and math.isfinite(y)]
+        if len(selected) < 2:
+            self.lbl_epd_decay.setText("--")
+            return
+        first_x, first_y = selected[0]
+        last_x, last_y = selected[-1]
+        hours = (last_x - first_x) / 3600.0
+        if hours <= 0 or first_y == 0:
+            self.lbl_epd_decay.setText("--")
+            return
+        decay_pct_h = (first_y - last_y) / abs(first_y) / hours * 100.0
+        self.lbl_epd_decay.setText(f"{decay_pct_h:.6g} %/h (n={len(selected)})")
 
     def on_material_changed(self, name):
         self.material_name = name
@@ -955,6 +1080,7 @@ class QCMApp(QWidget):
             if self.freq_data: self.plot_f.enableAutoRange(axis='y')
         self.curve_t.setData(x_data, list(self.thick_data))
         self.curve_r.setData(x_data, list(self.rate_data))
+        self.update_epd_plot()
         self.update_deposition_stats()
 
     def process_chunk(self, data_list):
