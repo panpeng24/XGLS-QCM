@@ -177,6 +177,9 @@ class QCMApp(QWidget):
         self.last_smooth_rate = 0.0
         self.plot_dirty = False
         self.last_plot_refresh_time = 0.0
+        self.csv_file = None
+        self.csv_writer = None
+        self.rate_region_initialized = False
 
         # 数据容器
         MAX_LEN = 100000
@@ -350,8 +353,11 @@ class QCMApp(QWidget):
         self.lbl_stat_total_mass = QLabel("--")
         self.lbl_stat_avg_rate_a = QLabel("--")
         self.lbl_stat_avg_rate_ng = QLabel("--")
+        self.lbl_rate_region_mean = QLabel("--")
+        self.lbl_rate_region_std = QLabel("--")
         for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
-                    self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng]:
+                    self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
+                    self.lbl_rate_region_mean, self.lbl_rate_region_std]:
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setStyleSheet("background: #fafafa; border: 1px solid #ddd; padding: 3px;")
 
@@ -361,6 +367,8 @@ class QCMApp(QWidget):
         f_stats.addRow("Total Mass (Ref):", self.lbl_stat_total_mass)
         f_stats.addRow("Average rate (Å/s):", self.lbl_stat_avg_rate_a)
         f_stats.addRow("Average rate (ng/s):", self.lbl_stat_avg_rate_ng)
+        f_stats.addRow("Rate ROI mean:", self.lbl_rate_region_mean)
+        f_stats.addRow("Rate ROI std:", self.lbl_rate_region_std)
         gb_stats.setLayout(f_stats)
 
         # --- E. 基础记录控制 ---
@@ -445,6 +453,10 @@ class QCMApp(QWidget):
         self.curve_f = self.plot_f.plot(pen=pg.mkPen('k', width=2))
         self.curve_t = self.plot_t.plot(pen=pg.mkPen('r', width=2))
         self.curve_r = self.plot_r.plot(pen=pg.mkPen('b', width=2))
+        self.rate_region = pg.LinearRegionItem([0, 10], brush=pg.mkBrush(33, 150, 243, 40))
+        self.rate_region.setZValue(10)
+        self.rate_region.sigRegionChanged.connect(self.update_rate_region_stats)
+        self.plot_r.addItem(self.rate_region)
         main_layout.addLayout(ctrl_panel, 1);
         main_layout.addWidget(self.plot_container, 4);
         self.setLayout(main_layout)
@@ -530,12 +542,15 @@ class QCMApp(QWidget):
     def on_auto_refresh_toggled(self, checked):
         if checked:
             self.last_plot_refresh_time = 0.0
+            self.plot_timer.stop()
             self.auto_refresh_timer.start()
             self.btn_auto_refresh.setText("Live Refresh: ON (1s)")
             self.btn_auto_refresh.setStyleSheet("background: #1565C0; color: white; padding: 6px; font-weight: bold;")
             self.on_auto_refresh_tick(force=True)
         else:
             self.auto_refresh_timer.stop()
+            if self.worker:
+                self.plot_timer.start()
             self.btn_auto_refresh.setText("Live Refresh: OFF (1s)")
             self.btn_auto_refresh.setStyleSheet("")
 
@@ -659,7 +674,8 @@ class QCMApp(QWidget):
         stats = self.calculate_deposition_stats()
         if stats is None:
             for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
-                        self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng]:
+                        self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
+                        self.lbl_rate_region_mean, self.lbl_rate_region_std]:
                 lbl.setText("--")
             return
 
@@ -668,6 +684,41 @@ class QCMApp(QWidget):
         self.lbl_stat_total_mass.setText(f"{stats['total_mass_ng']:.6g} ng")
         self.lbl_stat_avg_rate_a.setText(f"{stats['avg_rate_a_s']:.6g} Å/s")
         self.lbl_stat_avg_rate_ng.setText(f"{stats['avg_rate_ng_s']:.6g} ng/s")
+        self.update_rate_region_stats()
+
+    def ensure_rate_region_visible(self, x_data):
+        if not hasattr(self, 'rate_region') or not x_data or self.rate_region_initialized:
+            return
+        x0 = x_data[0]
+        x1 = x_data[min(len(x_data) - 1, max(1, min(100, len(x_data) - 1)))]
+        if x1 <= x0:
+            x1 = x0 + 1.0
+        self.rate_region.setRegion([x0, x1])
+        self.rate_region_initialized = True
+
+    def update_rate_region_stats(self):
+        if not hasattr(self, 'rate_region') or not self.time_data or not self.rate_data:
+            if hasattr(self, 'lbl_rate_region_mean'):
+                self.lbl_rate_region_mean.setText("--")
+                self.lbl_rate_region_std.setText("--")
+            return
+        start, end = self.rate_region.getRegion()
+        if start > end:
+            start, end = end, start
+        x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        rates = [r for x, r in zip(x_data, self.rate_data) if start <= x <= end and math.isfinite(r)]
+        if not rates:
+            self.lbl_rate_region_mean.setText("--")
+            self.lbl_rate_region_std.setText("--")
+            return
+        mean = sum(rates) / len(rates)
+        if len(rates) > 1:
+            variance = sum((r - mean) ** 2 for r in rates) / (len(rates) - 1)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        self.lbl_rate_region_mean.setText(f"{mean:.6g} Å/s (n={len(rates)})")
+        self.lbl_rate_region_std.setText(f"{std:.6g} Å/s")
 
     def on_material_changed(self, name):
         self.material_name = name
@@ -686,6 +737,7 @@ class QCMApp(QWidget):
 
     def on_time_axis_changed(self, checked):
         for ax in self.axes_list: ax.is_absolute = checked
+        self.rate_region_initialized = False
         self.refresh_plots()
 
     def on_raw_freq_changed(self, checked):
@@ -754,6 +806,48 @@ class QCMApp(QWidget):
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
 
+    def init_csv_log(self, custom_csv_path=""):
+        self.close_csv_log()
+        if custom_csv_path and custom_csv_path.strip():
+            filename = custom_csv_path
+        else:
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"QCM_Log_{ts_str}.csv"
+        dirname = os.path.dirname(os.path.abspath(filename))
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname)
+        self.csv_file = open(filename, mode='w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            "Timestamp_Unix", "Local_Time", "Elapsed_s", "Frequency_Raw_Hz",
+            "Frequency_Shift_Hz", "Thickness_nm", "Rate_A_s", "Material",
+            "Tooling_percent", "Ref_Area_cm2", "Mass_Density_QCM_ng_cm2",
+            "Total_Mass_Ref_ng", "Average_Rate_A_s", "Average_Rate_ng_s"
+        ])
+        self.on_log_path_received(os.path.abspath(filename))
+
+    def close_csv_log(self):
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+    def write_csv_row(self, now_ts, t_rel, raw_f, delta_f, thick, rate):
+        if not self.csv_writer:
+            return
+        stats = self.calculate_deposition_stats()
+        dt_str = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S.%f")
+        row = [
+            f"{now_ts:.6f}", dt_str, f"{t_rel:.6f}", f"{raw_f:.9f}",
+            f"{delta_f:.9f}", f"{thick:.9f}", f"{rate:.9f}", self.material_name,
+            f"{self.spin_tooling.value():.6f}", f"{self.spin_ref_area.value():.6f}",
+            f"{stats['mass_density_ng_cm2']:.9f}" if stats else "",
+            f"{stats['total_mass_ng']:.9f}" if stats else "",
+            f"{stats['avg_rate_a_s']:.9f}" if stats else "",
+            f"{stats['avg_rate_ng_s']:.9f}" if stats else "",
+        ]
+        self.csv_writer.writerow(row)
+
     def start_experiment(self):
         src_id = self.group_source.checkedId()
         self.lbl_net_status.setText("Disconnected");
@@ -793,19 +887,27 @@ class QCMApp(QWidget):
             self.last_smooth_rate = 0.0
             self.plot_dirty = False
             self.last_plot_refresh_time = 0.0
+            self.rate_region_initialized = False
             self.update_deposition_stats()
 
             speed = self.spin_speed.value();
             save_csv = self.chk_record.isChecked();
             custom_path = self.input_csv_path.text()
-            self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=save_csv,
-                                    custom_csv_path=custom_path)
+            if save_csv:
+                self.init_csv_log(custom_path)
+            else:
+                self.close_csv_log()
+            self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=False,
+                                    custom_csv_path="")
             self.worker.chunk_signal.connect(self.process_chunk);
             self.worker.finished_signal.connect(self.on_replay_finished)
             self.worker.error_signal.connect(self.on_worker_error);
             self.worker.log_path_signal.connect(self.on_log_path_received)
             self.worker.start();
-            self.plot_timer.start()
+            if self.btn_auto_refresh.isChecked():
+                self.auto_refresh_timer.start()
+            else:
+                self.plot_timer.start()
             if src_id == 2 and not self.btn_auto_refresh.isChecked():
                 self.btn_auto_refresh.setChecked(True)
             self.btn_start.setEnabled(False);
@@ -817,8 +919,10 @@ class QCMApp(QWidget):
 
     def stop_experiment(self):
         self.plot_timer.stop()
+        self.auto_refresh_timer.stop()
         if self.worker: self.worker.stop(); self.worker = None
         if self.ds: self.ds.disconnect()
+        self.close_csv_log()
         self.input_csv_path.setEnabled(True);
         self.btn_csv_browse.setEnabled(True)
         self.btn_start.setEnabled(True);
@@ -842,6 +946,7 @@ class QCMApp(QWidget):
         if not self.time_data: return
         self.plot_dirty = False
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        self.ensure_rate_region_visible(x_data)
         if self.chk_raw_freq.isChecked():
             self.curve_f.setData(x_data, list(self.raw_freq_data))
             if self.raw_freq_data: self.plot_f.enableAutoRange(axis='y')
@@ -866,8 +971,8 @@ class QCMApp(QWidget):
             self.raw_freq_data.append(raw_f)
             self.thick_data.append(thick)
 
-            # 使用 V3.6 的平滑逻辑
-            raw_rate = qcm_calc.calc_rate(list(self.time_data), list(self.thick_data), window=60)
+            # 使用 V3.6 的平滑逻辑，只取最近窗口，避免大文件回放时每个点复制全量数据。
+            raw_rate = qcm_calc.calc_rate(list(self.time_data)[-60:], list(self.thick_data)[-60:], window=60)
             alpha = 0.2
             if len(self.rate_data) == 0:
                 smooth_rate = raw_rate
@@ -875,6 +980,10 @@ class QCMApp(QWidget):
                 smooth_rate = alpha * raw_rate + (1 - alpha) * self.last_smooth_rate
             self.last_smooth_rate = smooth_rate
             self.rate_data.append(smooth_rate)
+            self.write_csv_row(now_ts, t_rel, raw_f, delta_f, thick, smooth_rate)
+
+        if self.csv_file:
+            self.csv_file.flush()
 
         self.plot_dirty = True
         if self.btn_auto_refresh.isChecked():
