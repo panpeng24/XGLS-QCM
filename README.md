@@ -77,18 +77,24 @@ Tooling Factor 校准：需根据实际镀膜工艺校准（实际厚度 / 监�
 碳膜密度：蒸发碳膜密度通常在 1.8-2.25 g/cm³ 之间，默认取石墨标准值 2.25，可根据实验需求调整；
 稳态判断阈值：需根据具体工艺场景调整（如高精度镀膜可设为 0.5 Hz/min，粗镀膜可设为 2.0 Hz/min）。
 
-## Troubleshooting: `SyntaxError` on a line starting with `@@`
+## Troubleshooting: `SyntaxError` on a line starting with `@@` or a hash
 
-If Python reports an error like:
+If Python reports an error like either of these:
 
 ```text
 SyntaxError: invalid syntax
 @@ -99,117 +100,120 @@ class QCMWorker(QThread):
 ```
 
-then a unified-diff patch hunk was copied into `main.py` as plain text. Lines that
-start with `@@`, `diff --git`, `<<<<<<<`, `=======`, or `>>>>>>>` are not Python
-code and must not appear in the source file.
+```text
+SyntaxError: invalid syntax
+dc9ceaaf753ae1809d0f715fae5b.
+```
+
+then a unified-diff patch hunk, PR text, or commit/hash fragment was copied into
+`main.py` as plain text. Lines that start with `@@`, `diff --git`, `<<<<<<<`,
+`=======`, `>>>>>>>`, or a standalone hash are not Python code and must not appear
+in the source file.
 
 To check the repository copy before running the GUI:
 
@@ -97,6 +103,6 @@ python tools/check_source_integrity.py
 python -m py_compile main.py
 ```
 
-If the check reports a marker, replace the affected file with the clean version
-from this repository (or apply the patch with `git apply`/`git pull` instead of
-copy-pasting the diff into `main.py`).
+If the check reports an artifact, remove that line or replace the affected file
+with the clean version from this repository. Apply changes with `git apply` or
+`git pull` instead of copy-pasting PR/diff text or commit hashes into `main.py`.
