@@ -119,6 +119,15 @@ In the QCM GUI:
 2. Fill in the InfluxDB URL, Org, Bucket, and API Token.
 3. Start acquisition or file replay.
 
+For the LRP P2 dashboard, the GUI includes this shortcut URL:
+
+```text
+http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1
+```
+
+Note that the Grafana URL opens the dashboard only; real-time data must still be
+written to the InfluxDB data source configured behind that dashboard.
+
 The app writes measurement `qcm` with tags `material` and `platform`, and fields:
 
 - `frequency_raw_hz`

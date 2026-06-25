@@ -8,6 +8,7 @@ import queue
 import threading
 import urllib.parse
 import urllib.request
+import webbrowser
 from collections import deque
 from bisect import bisect_left
 
@@ -527,10 +528,18 @@ class QCMApp(QWidget):
         self.input_influx_token = QLineEdit()
         self.input_influx_token.setEchoMode(QLineEdit.Password)
         self.input_influx_token.setPlaceholderText("InfluxDB API token")
-        f_grafana.addRow("URL:", self.input_influx_url)
+        self.input_grafana_dashboard = QLineEdit(
+            "http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1"
+        )
+        self.input_grafana_dashboard.setToolTip("Grafana 看板页面地址；用于快速打开看板，不是数据写入接口。")
+        self.btn_open_grafana = QPushButton("Open Dashboard")
+        self.btn_open_grafana.clicked.connect(self.open_grafana_dashboard)
+        f_grafana.addRow("Influx URL:", self.input_influx_url)
         f_grafana.addRow("Org:", self.input_influx_org)
         f_grafana.addRow("Bucket:", self.input_influx_bucket)
         f_grafana.addRow("Token:", self.input_influx_token)
+        f_grafana.addRow("Dashboard:", self.input_grafana_dashboard)
+        f_grafana.addRow(self.btn_open_grafana)
 
         self.btn_start = QPushButton("START");
         self.btn_start.setStyleSheet("background: #2e7d32; color: white; padding: 10px; font-weight: bold;")
@@ -1050,6 +1059,11 @@ class QCMApp(QWidget):
 
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
+
+    def open_grafana_dashboard(self):
+        url = self.input_grafana_dashboard.text().strip()
+        if url:
+            webbrowser.open(url)
 
     def init_grafana_uploader(self):
         self.close_grafana_uploader()
