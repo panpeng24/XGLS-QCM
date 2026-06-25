@@ -431,7 +431,13 @@ class QCMApp(QWidget):
 
         # --- D. 沉积统计 ---
         gb_stats = QGroupBox("4. Deposition Statistics")
-        f_stats = QFormLayout()
+        gb_stats.setCheckable(True)
+        gb_stats.setChecked(False)
+        gb_stats.setToolTip("勾选标题展开/折叠沉积统计与 EPD 设置，减少左侧控制面板占用空间。")
+        v_stats = QVBoxLayout()
+        self.widget_stats_content = QWidget()
+        f_stats = QFormLayout(self.widget_stats_content)
+        f_stats.setContentsMargins(0, 0, 0, 0)
 
         self.spin_ref_area = QDoubleSpinBox()
         self.spin_ref_area.setRange(0.000001, 1000000.0)
@@ -475,7 +481,14 @@ class QCMApp(QWidget):
         f_stats.addRow("Rate ROI mean:", self.lbl_rate_region_mean)
         f_stats.addRow("Rate ROI std:", self.lbl_rate_region_std)
         f_stats.addRow("EPD decay:", self.lbl_epd_decay)
-        gb_stats.setLayout(f_stats)
+        v_stats.addWidget(self.widget_stats_content)
+        gb_stats.setLayout(v_stats)
+        self.widget_stats_content.setVisible(False)
+        gb_stats.toggled.connect(self.widget_stats_content.setVisible)
+        gb_stats.toggled.connect(lambda checked: gb_stats.setTitle(
+            "4. Deposition Statistics" if checked else "4. Deposition Statistics (collapsed)"
+        ))
+        gb_stats.setTitle("4. Deposition Statistics (collapsed)")
 
         # --- E. 基础记录控制 ---
         gb_ctrl = QGroupBox("5. Control")
