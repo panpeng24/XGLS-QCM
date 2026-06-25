@@ -4,6 +4,10 @@ import csv
 import os
 from datetime import datetime
 import math
+import queue
+import threading
+import urllib.parse
+import urllib.request
 from collections import deque
 from bisect import bisect_left
 
@@ -34,6 +38,90 @@ except ImportError as e:
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 pg.setConfigOption('antialias', True)
+
+
+# ==========================================
+# Grafana / InfluxDB 上传器
+# ==========================================
+class GrafanaInfluxUploader:
+    def __init__(self, base_url, org, bucket, token, measurement="qcm"):
+        self.base_url = base_url.rstrip("/")
+        self.org = org.strip()
+        self.bucket = bucket.strip()
+        self.token = token.strip()
+        self.measurement = measurement.strip() or "qcm"
+        self.queue = queue.Queue(maxsize=10000)
+        self.running = True
+        self.last_error = ""
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def escape_tag(value):
+        return str(value).replace(" ", "\\ ").replace(",", "\\,").replace("=", "\\=")
+
+    @staticmethod
+    def format_field(value):
+        if isinstance(value, str):
+            return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        return f"{float(value):.12g}"
+
+    def build_line(self, fields, tags, timestamp_s):
+        tag_part = "".join(f",{self.escape_tag(k)}={self.escape_tag(v)}" for k, v in tags.items() if v != "")
+        field_part = ",".join(f"{self.escape_tag(k)}={self.format_field(v)}" for k, v in fields.items())
+        timestamp_ns = int(timestamp_s * 1_000_000_000)
+        return f"{self.escape_tag(self.measurement)}{tag_part} {field_part} {timestamp_ns}"
+
+    def enqueue(self, fields, tags, timestamp_s):
+        if not self.running:
+            return
+        line = self.build_line(fields, tags, timestamp_s)
+        try:
+            self.queue.put_nowait(line)
+        except queue.Full:
+            # Drop oldest data rather than blocking the GUI.
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(line)
+            except queue.Full:
+                pass
+
+    def _write_batch(self, lines):
+        params = urllib.parse.urlencode({"org": self.org, "bucket": self.bucket, "precision": "ns"})
+        url = f"{self.base_url}/api/v2/write?{params}"
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        if self.token:
+            headers["Authorization"] = f"Token {self.token}"
+        req = urllib.request.Request(url, data=("\n".join(lines)).encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+
+    def _run(self):
+        buffer = []
+        last_flush = time.monotonic()
+        while self.running or not self.queue.empty():
+            timeout = max(0.0, 1.0 - (time.monotonic() - last_flush))
+            try:
+                line = self.queue.get(timeout=timeout)
+                buffer.append(line)
+            except queue.Empty:
+                pass
+            if buffer and (len(buffer) >= 200 or time.monotonic() - last_flush >= 1.0 or not self.running):
+                try:
+                    self._write_batch(buffer)
+                    self.last_error = ""
+                    buffer = []
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    buffer = []
+                last_flush = time.monotonic()
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=5)
 
 
 # ==========================================
@@ -179,6 +267,7 @@ class QCMApp(QWidget):
         self.last_plot_refresh_time = 0.0
         self.csv_file = None
         self.csv_writer = None
+        self.grafana_uploader = None
         self.rate_region_initialized = False
 
         # 数据容器
@@ -414,6 +503,22 @@ class QCMApp(QWidget):
         self.btn_auto_refresh.setToolTip("每秒自动读取最新缓冲数据并刷新曲线；文件回放模式下无需点击图表也会更新显示。")
         self.btn_auto_refresh.toggled.connect(self.on_auto_refresh_toggled)
 
+        self.chk_grafana_upload = QCheckBox("Upload to Grafana (InfluxDB)")
+        self.chk_grafana_upload.setToolTip("实时写入 InfluxDB v2；Grafana 添加该 InfluxDB 数据源后即可做看板。")
+        self.widget_grafana = QWidget()
+        f_grafana = QFormLayout(self.widget_grafana)
+        f_grafana.setContentsMargins(0, 0, 0, 0)
+        self.input_influx_url = QLineEdit("http://localhost:8086")
+        self.input_influx_org = QLineEdit("qcm")
+        self.input_influx_bucket = QLineEdit("qcm")
+        self.input_influx_token = QLineEdit()
+        self.input_influx_token.setEchoMode(QLineEdit.Password)
+        self.input_influx_token.setPlaceholderText("InfluxDB API token")
+        f_grafana.addRow("URL:", self.input_influx_url)
+        f_grafana.addRow("Org:", self.input_influx_org)
+        f_grafana.addRow("Bucket:", self.input_influx_bucket)
+        f_grafana.addRow("Token:", self.input_influx_token)
+
         self.btn_start = QPushButton("START");
         self.btn_start.setStyleSheet("background: #2e7d32; color: white; padding: 10px; font-weight: bold;")
         self.btn_start.clicked.connect(self.start_experiment)
@@ -429,6 +534,8 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.widget_csv_path)
         vb_ctrl.addWidget(self.btn_save_img)
         vb_ctrl.addWidget(self.btn_auto_refresh)
+        vb_ctrl.addWidget(self.chk_grafana_upload)
+        vb_ctrl.addWidget(self.widget_grafana)
         vb_ctrl.addWidget(self.btn_start);
         vb_ctrl.addWidget(self.btn_stop);
         vb_ctrl.addWidget(self.lbl_status)
@@ -931,6 +1038,37 @@ class QCMApp(QWidget):
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
 
+    def init_grafana_uploader(self):
+        self.close_grafana_uploader()
+        if not self.chk_grafana_upload.isChecked():
+            return
+        self.grafana_uploader = GrafanaInfluxUploader(
+            self.input_influx_url.text(),
+            self.input_influx_org.text(),
+            self.input_influx_bucket.text(),
+            self.input_influx_token.text(),
+        )
+
+    def close_grafana_uploader(self):
+        if self.grafana_uploader:
+            self.grafana_uploader.stop()
+            self.grafana_uploader = None
+
+    def upload_grafana_row(self, now_ts, raw_f, delta_f, thick, rate):
+        if not self.grafana_uploader:
+            return
+        fields = {
+            "frequency_raw_hz": raw_f,
+            "frequency_shift_hz": delta_f,
+            "thickness_nm": thick,
+            "rate_a_s": rate,
+        }
+        tags = {
+            "material": self.material_name,
+            "platform": self.combo_platform.currentText(),
+        }
+        self.grafana_uploader.enqueue(fields, tags, now_ts)
+
     def init_csv_log(self, custom_csv_path=""):
         self.close_csv_log()
         if custom_csv_path and custom_csv_path.strip():
@@ -1022,6 +1160,7 @@ class QCMApp(QWidget):
                 self.init_csv_log(custom_path)
             else:
                 self.close_csv_log()
+            self.init_grafana_uploader()
             self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=False,
                                     custom_csv_path="")
             self.worker.chunk_signal.connect(self.process_chunk);
@@ -1048,6 +1187,7 @@ class QCMApp(QWidget):
         if self.worker: self.worker.stop(); self.worker = None
         if self.ds: self.ds.disconnect()
         self.close_csv_log()
+        self.close_grafana_uploader()
         self.input_csv_path.setEnabled(True);
         self.btn_csv_browse.setEnabled(True)
         self.btn_start.setEnabled(True);
@@ -1107,6 +1247,7 @@ class QCMApp(QWidget):
             self.last_smooth_rate = smooth_rate
             self.rate_data.append(smooth_rate)
             self.write_csv_row(now_ts, t_rel, raw_f, delta_f, thick, smooth_rate)
+            self.upload_grafana_row(now_ts, raw_f, delta_f, thick, smooth_rate)
 
         if self.csv_file:
             self.csv_file.flush()

@@ -106,3 +106,31 @@ python -m py_compile main.py
 If the check reports an artifact, remove that line or replace the affected file
 with the clean version from this repository. Apply changes with `git apply` or
 `git pull` instead of copy-pasting PR/diff text or commit hashes into `main.py`.
+
+## Real-time Grafana dashboard export
+
+The GUI can stream calculated QCM data to Grafana through an InfluxDB v2 data
+source. Start InfluxDB, create a bucket (for example `qcm`) and an API token,
+then add that InfluxDB instance as a Grafana data source.
+
+In the QCM GUI:
+
+1. Enable **Upload to Grafana (InfluxDB)**.
+2. Fill in the InfluxDB URL, Org, Bucket, and API Token.
+3. Start acquisition or file replay.
+
+The app writes measurement `qcm` with tags `material` and `platform`, and fields:
+
+- `frequency_raw_hz`
+- `frequency_shift_hz`
+- `thickness_nm`
+- `rate_a_s`
+
+Example Flux query in Grafana:
+
+```flux
+from(bucket: "qcm")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "qcm")
+  |> filter(fn: (r) => r._field == "thickness_nm" or r._field == "rate_a_s")
+```
