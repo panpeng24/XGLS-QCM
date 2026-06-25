@@ -528,9 +528,14 @@ class QCMApp(QWidget):
         self.input_influx_token = QLineEdit()
         self.input_influx_token.setEchoMode(QLineEdit.Password)
         self.input_influx_token.setPlaceholderText("InfluxDB API token")
-        self.input_grafana_dashboard = QLineEdit(
-            "http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1"
-        )
+        self.grafana_dashboard_urls = {
+            "LRP P2": "http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1",
+            "LDP P1": "http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/ldp-p1?orgId=1&from=now-6h&to=now",
+        }
+        self.combo_grafana_dashboard = QComboBox()
+        self.combo_grafana_dashboard.addItems(self.grafana_dashboard_urls.keys())
+        self.combo_grafana_dashboard.currentTextChanged.connect(self.on_grafana_dashboard_changed)
+        self.input_grafana_dashboard = QLineEdit(self.grafana_dashboard_urls["LRP P2"])
         self.input_grafana_dashboard.setToolTip("Grafana 看板页面地址；用于快速打开看板，不是数据写入接口。")
         self.btn_open_grafana = QPushButton("Open Dashboard")
         self.btn_open_grafana.clicked.connect(self.open_grafana_dashboard)
@@ -538,7 +543,8 @@ class QCMApp(QWidget):
         f_grafana.addRow("Org:", self.input_influx_org)
         f_grafana.addRow("Bucket:", self.input_influx_bucket)
         f_grafana.addRow("Token:", self.input_influx_token)
-        f_grafana.addRow("Dashboard:", self.input_grafana_dashboard)
+        f_grafana.addRow("Dashboard Preset:", self.combo_grafana_dashboard)
+        f_grafana.addRow("Dashboard URL:", self.input_grafana_dashboard)
         f_grafana.addRow(self.btn_open_grafana)
 
         self.btn_start = QPushButton("START");
@@ -1059,6 +1065,11 @@ class QCMApp(QWidget):
 
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
+
+    def on_grafana_dashboard_changed(self, name):
+        url = self.grafana_dashboard_urls.get(name)
+        if url:
+            self.input_grafana_dashboard.setText(url)
 
     def open_grafana_dashboard(self):
         url = self.input_grafana_dashboard.text().strip()

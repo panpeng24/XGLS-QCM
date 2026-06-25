@@ -119,14 +119,15 @@ In the QCM GUI:
 2. Fill in the InfluxDB URL, Org, Bucket, and API Token.
 3. Start acquisition or file replay.
 
-For the LRP P2 dashboard, the GUI includes this shortcut URL:
+The GUI includes dashboard presets for multiple tools:
 
 ```text
-http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1
+LRP P2: http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1
+LDP P1: http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/ldp-p1?orgId=1&from=now-6h&to=now
 ```
 
-Note that the Grafana URL opens the dashboard only; real-time data must still be
-written to the InfluxDB data source configured behind that dashboard.
+Note that these Grafana URLs open dashboards only; real-time data must still be
+written to the InfluxDB data source configured behind each dashboard.
 
 The app writes measurement `qcm` with tags `material` and `platform`, and fields:
 
