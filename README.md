@@ -162,3 +162,7 @@ Version v4.5 improves replay compatibility in two areas:
 
 - **SQC-310**: the parser reads the `Start:` date/time line, uses the first CSV column as elapsed seconds, finds the `Sensors:` section in each data row, and takes each sensor group as `Rate, Thk, Freq`. If the selected SQC sensor has a zero/empty frequency, the parser falls back to the first valid non-zero sensor frequency so rows like `Sens1Freq=5964243.070` are still decoded and sent into the normal QCM thickness/rate calculations.
 - **IC6**: `CH1` through `CH8` can be checked independently or together. The selected primary channel is still used for the main statistics/export path, while all checked IC6 channels are calculated and plotted on the same synchronized time axis for frequency, thickness, and rate comparison.
+
+### Stability and layout notes
+
+The GUI limits plotted points to the newest 20,000 samples per curve while keeping the full in-memory/logging history, and rate calculations now use fixed 60-point windows instead of repeatedly slicing full replay histories. This reduces UI pressure during large file replay. Grafana/InfluxDB settings are opened from **Grafana Settings...** in a secondary dialog so the main control panel remains compact. IC6 channel checkboxes are arranged in a compact two-row grid.

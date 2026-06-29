@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QComboBox, QDoubleSpinBox, QMessageBox, QRadioButton, QButtonGroup,
     QLineEdit, QFormLayout, QGroupBox, QSpinBox, QCheckBox, QFileDialog,
-    QDateTimeEdit, QToolButton, QTabWidget
+    QDateTimeEdit, QToolButton, QTabWidget, QGridLayout, QDialog
 )
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal, QDateTime
 import pyqtgraph as pg
@@ -272,6 +272,8 @@ class QCMApp(QWidget):
         self.rate_region_initialized = False
         self.qcm_channel_data = {}
         self.channel_curves = {}
+        self.rate_time_window = deque(maxlen=60)
+        self.rate_thick_window = deque(maxlen=60)
 
         # 数据容器
         MAX_LEN = 100000
@@ -334,15 +336,17 @@ class QCMApp(QWidget):
         self.combo_replay_channel.setToolTip("IC6 uses CH1-CH8 and defaults to CH6. SQC-310 uses the same selector as Sens1-Sens8 and defaults to Sens1 when SQC-310 is selected.")
         self.combo_replay_format.currentTextChanged.connect(self.on_replay_format_changed)
         self.widget_ic6_channels = QWidget()
-        layout_ic6_channels = QHBoxLayout(self.widget_ic6_channels)
+        layout_ic6_channels = QGridLayout(self.widget_ic6_channels)
         layout_ic6_channels.setContentsMargins(0, 0, 0, 0)
+        layout_ic6_channels.setHorizontalSpacing(4)
+        layout_ic6_channels.setVerticalSpacing(0)
         self.chk_ic6_channels = []
         for i in range(1, 9):
             chk = QCheckBox(f"CH{i}")
             chk.setChecked(i == 6)
             chk.setToolTip("Check multiple IC6 channels to calculate and plot them on the same synchronized time axis.")
             self.chk_ic6_channels.append(chk)
-            layout_ic6_channels.addWidget(chk)
+            layout_ic6_channels.addWidget(chk, 0 if i <= 4 else 1, (i - 1) % 4)
         f_file_options.addRow("Replay Format:", self.combo_replay_format)
         f_file_options.addRow("Primary Channel/Sensor:", self.combo_replay_channel)
         f_file_options.addRow("IC6 Plot Channels:", self.widget_ic6_channels)
@@ -408,7 +412,7 @@ class QCMApp(QWidget):
         self.chk_abs_time.toggled.connect(self.on_time_axis_changed)
 
         self.chk_raw_freq = QCheckBox("Show Raw Freq (Hz)");
-        self.chk_raw_freq.setChecked(False)
+        self.chk_raw_freq.setChecked(True)
         self.chk_raw_freq.setStyleSheet("color: #D32F2F;")
         self.chk_raw_freq.toggled.connect(self.on_raw_freq_changed)
 
@@ -590,8 +594,10 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.widget_csv_path)
         vb_ctrl.addWidget(self.btn_save_img)
         vb_ctrl.addWidget(self.btn_auto_refresh)
+        self.btn_grafana_settings = QPushButton("Grafana Settings...")
+        self.btn_grafana_settings.clicked.connect(self.open_grafana_settings)
         vb_ctrl.addWidget(self.chk_grafana_upload)
-        vb_ctrl.addWidget(self.widget_grafana)
+        vb_ctrl.addWidget(self.btn_grafana_settings)
         vb_ctrl.addWidget(self.btn_start);
         vb_ctrl.addWidget(self.btn_stop);
         vb_ctrl.addWidget(self.lbl_status)
@@ -612,9 +618,10 @@ class QCMApp(QWidget):
         self.axis_t = DynamicTimeAxis(orientation='bottom');
         self.axis_r = DynamicTimeAxis(orientation='bottom')
         self.axes_list = [self.axis_f, self.axis_t, self.axis_r];
-        self.axis_f.is_absolute = True
+        for axis in self.axes_list:
+            axis.is_absolute = True
 
-        self.plot_f = pg.PlotWidget(title="Freq Shift (Hz)", axisItems={'bottom': self.axis_f})
+        self.plot_f = pg.PlotWidget(title="Raw Frequency (Hz)", axisItems={'bottom': self.axis_f})
         self.plot_t = pg.PlotWidget(title="Thickness (nm)", axisItems={'bottom': self.axis_t})
         self.plot_r = pg.PlotWidget(title="Rate (Å/s)", axisItems={'bottom': self.axis_r})
 
@@ -650,6 +657,7 @@ class QCMApp(QWidget):
         self.rate_region.setZValue(10)
         self.rate_region.sigRegionChanged.connect(self.update_rate_region_stats)
         self.plot_r.addItem(self.rate_region)
+        self.on_raw_freq_changed(True)
         main_layout.addLayout(ctrl_panel, 1);
         main_layout.addWidget(self.plot_container, 4);
         self.setLayout(main_layout)
@@ -687,6 +695,8 @@ class QCMApp(QWidget):
             "shift": deque(maxlen=100000),
             "thick": deque(maxlen=100000),
             "rate": deque(maxlen=100000),
+            "rate_time_window": deque(maxlen=60),
+            "rate_thick_window": deque(maxlen=60),
             "f0": None,
             "last_rate": 0.0,
         }
@@ -1124,6 +1134,16 @@ class QCMApp(QWidget):
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
 
+    def open_grafana_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Grafana / InfluxDB Settings")
+        layout = QVBoxLayout(dialog)
+        self.widget_grafana.setParent(dialog)
+        layout.addWidget(self.widget_grafana)
+        dialog.finished.connect(lambda _result: self.widget_grafana.setParent(None))
+        dialog.resize(520, 260)
+        dialog.exec_()
+
     def on_grafana_dashboard_changed(self, name):
         url = self.grafana_dashboard_urls.get(name)
         if url:
@@ -1272,6 +1292,8 @@ class QCMApp(QWidget):
             self.raw_freq_data.clear();
             self.thick_data.clear();
             self.rate_data.clear()
+            self.rate_time_window.clear()
+            self.rate_thick_window.clear()
             self.f0 = None;
             self.start_ts = None;
             self.last_smooth_rate = 0.0
@@ -1338,6 +1360,15 @@ class QCMApp(QWidget):
     def on_worker_error(self, msg):
         self.stop_experiment(); QMessageBox.warning(self, "Error", msg)
 
+    @staticmethod
+    def plot_tail_xy(x_values, y_values, max_points=20000):
+        x_list = list(x_values)
+        y_list = list(y_values)
+        if len(x_list) > max_points:
+            x_list = x_list[-max_points:]
+            y_list = y_list[-max_points:]
+        return x_list, y_list
+
     def clear_channel_curves(self):
         for curves in self.channel_curves.values():
             for curve in curves.values():
@@ -1369,27 +1400,34 @@ class QCMApp(QWidget):
                 del self.channel_curves[channel]
         for channel, store in self.qcm_channel_data.items():
             curves = self.ensure_channel_curves(channel)
-            x_data = list(store["abs_time"] if x_is_absolute else store["time"])
+            x_source = store["abs_time"] if x_is_absolute else store["time"]
             if self.chk_raw_freq.isChecked():
-                curves["freq"].setData(x_data, list(store["raw"]))
+                x_data, y_data = self.plot_tail_xy(x_source, store["raw"])
+                curves["freq"].setData(x_data, y_data)
             else:
-                curves["freq"].setData(x_data, list(store["shift"]))
-            curves["thick"].setData(x_data, list(store["thick"]))
-            curves["rate"].setData(x_data, list(store["rate"]))
+                x_data, y_data = self.plot_tail_xy(x_source, store["shift"])
+                curves["freq"].setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, store["thick"])
+            curves["thick"].setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, store["rate"])
+            curves["rate"].setData(x_data, y_data)
 
     def refresh_plots(self):
         if not self.time_data: return
         self.plot_dirty = False
-        x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
-        self.ensure_rate_region_visible(x_data)
+        x_source = self.abs_time_data if self.chk_abs_time.isChecked() else self.time_data
+        x_all = list(x_source)
+        self.ensure_rate_region_visible(x_all)
         if self.chk_raw_freq.isChecked():
-            self.curve_f.setData(x_data, list(self.raw_freq_data))
-            if self.raw_freq_data: self.plot_f.enableAutoRange(axis='y')
+            x_data, y_data = self.plot_tail_xy(x_source, self.raw_freq_data)
+            self.curve_f.setData(x_data, y_data)
         else:
-            self.curve_f.setData(x_data, list(self.freq_data))
-            if self.freq_data: self.plot_f.enableAutoRange(axis='y')
-        self.curve_t.setData(x_data, list(self.thick_data))
-        self.curve_r.setData(x_data, list(self.rate_data))
+            x_data, y_data = self.plot_tail_xy(x_source, self.freq_data)
+            self.curve_f.setData(x_data, y_data)
+        x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
+        self.curve_t.setData(x_data, y_data)
+        x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
+        self.curve_r.setData(x_data, y_data)
         self.update_ic6_channel_plots(self.chk_abs_time.isChecked())
         self.update_epd_plot()
         self.update_deposition_stats()
@@ -1413,7 +1451,9 @@ class QCMApp(QWidget):
             store["raw"].append(raw_f)
             store["shift"].append(delta_f)
             store["thick"].append(thick)
-            raw_rate = qcm_calc.calc_rate(list(store["time"])[-60:], list(store["thick"])[-60:], window=60)
+            store["rate_time_window"].append(t_rel)
+            store["rate_thick_window"].append(thick)
+            raw_rate = qcm_calc.calc_rate(list(store["rate_time_window"]), list(store["rate_thick_window"]), window=60)
             if len(store["rate"]) == 0:
                 smooth_rate = raw_rate
             else:
@@ -1449,7 +1489,9 @@ class QCMApp(QWidget):
             self.thick_data.append(thick)
 
             # 使用 V3.6 的平滑逻辑，只取最近窗口，避免大文件回放时每个点复制全量数据。
-            raw_rate = qcm_calc.calc_rate(list(self.time_data)[-60:], list(self.thick_data)[-60:], window=60)
+            self.rate_time_window.append(t_rel)
+            self.rate_thick_window.append(thick)
+            raw_rate = qcm_calc.calc_rate(list(self.rate_time_window), list(self.rate_thick_window), window=60)
             alpha = 0.2
             if len(self.rate_data) == 0:
                 smooth_rate = raw_rate
@@ -1470,7 +1512,6 @@ class QCMApp(QWidget):
             if current_time - self.last_plot_refresh_time >= 1.0:
                 self.refresh_plots()
                 self.last_plot_refresh_time = current_time
-                QApplication.processEvents()
         else:
             self.refresh_plots()
 
