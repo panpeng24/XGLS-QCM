@@ -166,3 +166,7 @@ Version v4.5 improves replay compatibility in two areas:
 ### Stability and layout notes
 
 The GUI limits plotted points to the newest 20,000 samples per curve while keeping the full in-memory/logging history, and rate calculations now use fixed 60-point windows instead of repeatedly slicing full replay histories. This reduces UI pressure during large file replay. Grafana/InfluxDB settings are opened from **Grafana Settings...** in a secondary dialog so the main control panel remains compact. IC6 channel checkboxes are arranged in a compact two-row grid.
+
+### IC6 channel visibility
+
+In File Replay, IC6 `CH1`-`CH8` checkboxes now directly control whether each channel curve is displayed. All eight IC6 channels are calculated from the replay rows, and each visible channel uses a distinct pyqtgraph color on the synchronized frequency, thickness, and rate plots. Unchecking a channel hides its curves without stopping replay.

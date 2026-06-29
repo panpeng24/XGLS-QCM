@@ -344,7 +344,8 @@ class QCMApp(QWidget):
         for i in range(1, 9):
             chk = QCheckBox(f"CH{i}")
             chk.setChecked(i == 6)
-            chk.setToolTip("Check multiple IC6 channels to calculate and plot them on the same synchronized time axis.")
+            chk.setToolTip("Check/uncheck to show or hide this IC6 channel on the synchronized plots.")
+            chk.toggled.connect(self.on_ic6_channel_visibility_changed)
             self.chk_ic6_channels.append(chk)
             layout_ic6_channels.addWidget(chk, 0 if i <= 4 else 1, (i - 1) % 4)
         f_file_options.addRow("Replay Format:", self.combo_replay_format)
@@ -686,6 +687,13 @@ class QCMApp(QWidget):
         if primary not in channels:
             channels.insert(0, primary)
         return channels or [primary]
+
+    def get_visible_ic6_channels(self):
+        return {idx + 1 for idx, chk in enumerate(self.chk_ic6_channels) if chk.isChecked()}
+
+    def on_ic6_channel_visibility_changed(self, _checked=False):
+        if hasattr(self, "qcm_channel_data") and self.qcm_channel_data:
+            self.refresh_plots()
 
     def make_channel_store(self):
         return {
@@ -1382,7 +1390,7 @@ class QCMApp(QWidget):
         if channel in self.channel_curves:
             return self.channel_curves[channel]
         color = pg.intColor(channel - 1, hues=8)
-        pen = pg.mkPen(color, width=1.5)
+        pen = pg.mkPen(color, width=2)
         curves = {
             "freq": self.plot_f.plot(pen=pen, name=f"CH{channel}"),
             "thick": self.plot_t.plot(pen=pen, name=f"CH{channel}"),
@@ -1392,13 +1400,15 @@ class QCMApp(QWidget):
         return curves
 
     def update_ic6_channel_plots(self, x_is_absolute):
-        active_channels = set(self.qcm_channel_data)
+        visible_channels = self.get_visible_ic6_channels()
+        active_channels = set(self.qcm_channel_data) & visible_channels
         for channel in list(self.channel_curves):
             if channel not in active_channels:
                 for curve in self.channel_curves[channel].values():
                     curve.setData([], [])
                 del self.channel_curves[channel]
-        for channel, store in self.qcm_channel_data.items():
+        for channel in sorted(active_channels):
+            store = self.qcm_channel_data[channel]
             curves = self.ensure_channel_curves(channel)
             x_source = store["abs_time"] if x_is_absolute else store["time"]
             if self.chk_raw_freq.isChecked():
@@ -1418,16 +1428,25 @@ class QCMApp(QWidget):
         x_source = self.abs_time_data if self.chk_abs_time.isChecked() else self.time_data
         x_all = list(x_source)
         self.ensure_rate_region_visible(x_all)
-        if self.chk_raw_freq.isChecked():
+        is_ic6_replay = self.current_qcm_source_format == "IC6" and bool(self.qcm_channel_data)
+        if is_ic6_replay:
+            self.curve_f.setData([], [])
+            self.curve_t.setData([], [])
+            self.curve_r.setData([], [])
+        elif self.chk_raw_freq.isChecked():
             x_data, y_data = self.plot_tail_xy(x_source, self.raw_freq_data)
             self.curve_f.setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
+            self.curve_t.setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
+            self.curve_r.setData(x_data, y_data)
         else:
             x_data, y_data = self.plot_tail_xy(x_source, self.freq_data)
             self.curve_f.setData(x_data, y_data)
-        x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
-        self.curve_t.setData(x_data, y_data)
-        x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
-        self.curve_r.setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
+            self.curve_t.setData(x_data, y_data)
+            x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
+            self.curve_r.setData(x_data, y_data)
         self.update_ic6_channel_plots(self.chk_abs_time.isChecked())
         self.update_epd_plot()
         self.update_deposition_stats()
@@ -1435,9 +1454,8 @@ class QCMApp(QWidget):
     def update_ic6_channel_data(self, now_ts, t_rel, metadata):
         if metadata.get("source_format") != "IC6" or not metadata.get("frequencies"):
             return
-        selected_channels = metadata.get("selected_channels") or [metadata.get("channel", 6)]
         frequencies = metadata.get("frequencies")
-        for channel in selected_channels:
+        for channel in range(1, len(frequencies) + 1):
             if channel < 1 or channel > len(frequencies):
                 continue
             store = self.qcm_channel_data.setdefault(channel, self.make_channel_store())
