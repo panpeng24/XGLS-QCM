@@ -255,7 +255,7 @@ class DynamicTimeAxis(pg.AxisItem):
 class QCMApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("XKL QCM Analyzer Pro V4.0 (Integrated Report)")
+        self.setWindowTitle("XKL QCM Analyzer Pro V4.5 (Integrated Report)")
         self.resize(1400, 900)
 
         self.worker = None
@@ -270,6 +270,8 @@ class QCMApp(QWidget):
         self.csv_writer = None
         self.grafana_uploader = None
         self.rate_region_initialized = False
+        self.qcm_channel_data = {}
+        self.channel_curves = {}
 
         # 数据容器
         MAX_LEN = 100000
@@ -331,8 +333,19 @@ class QCMApp(QWidget):
         self.combo_replay_channel.setCurrentText("CH6")
         self.combo_replay_channel.setToolTip("IC6 uses CH1-CH8 and defaults to CH6. SQC-310 uses the same selector as Sens1-Sens8 and defaults to Sens1 when SQC-310 is selected.")
         self.combo_replay_format.currentTextChanged.connect(self.on_replay_format_changed)
+        self.widget_ic6_channels = QWidget()
+        layout_ic6_channels = QHBoxLayout(self.widget_ic6_channels)
+        layout_ic6_channels.setContentsMargins(0, 0, 0, 0)
+        self.chk_ic6_channels = []
+        for i in range(1, 9):
+            chk = QCheckBox(f"CH{i}")
+            chk.setChecked(i == 6)
+            chk.setToolTip("Check multiple IC6 channels to calculate and plot them on the same synchronized time axis.")
+            self.chk_ic6_channels.append(chk)
+            layout_ic6_channels.addWidget(chk)
         f_file_options.addRow("Replay Format:", self.combo_replay_format)
-        f_file_options.addRow("Channel/Sensor:", self.combo_replay_channel)
+        f_file_options.addRow("Primary Channel/Sensor:", self.combo_replay_channel)
+        f_file_options.addRow("IC6 Plot Channels:", self.widget_ic6_channels)
 
         self.widget_net = QWidget()
         f_net = QFormLayout(self.widget_net);
@@ -619,7 +632,7 @@ class QCMApp(QWidget):
         self.plot_r.setXLink(self.plot_t)
         self.curve_f = self.plot_f.plot(pen=pg.mkPen('k', width=2))
         self.curve_t = self.plot_t.plot(pen=pg.mkPen('r', width=2))
-        self.curve_r = self.plot_r.plot(pen=pg.mkPen('b', width=2))
+        self.curve_r = self.plot_r.plot(pen=pg.mkPen('b', width=2), name="Primary")
         self.plot_r.plotItem.showAxis('right')
         self.epd_axis = self.plot_r.plotItem.getAxis('right')
         self.epd_axis.setLabel('EPD', units='nA')
@@ -651,11 +664,32 @@ class QCMApp(QWidget):
 
 
     def on_replay_format_changed(self, fmt):
-        if fmt == "SQC-310" and self.combo_replay_channel.currentText() == "CH6":
+        is_sqc = fmt == "SQC-310"
+        if is_sqc and self.combo_replay_channel.currentText() == "CH6":
             self.combo_replay_channel.setCurrentText("CH1")
+        self.widget_ic6_channels.setVisible(not is_sqc)
         self.combo_replay_channel.setToolTip(
-            "IC6: CH1-CH8 (default CH6). SQC-310: Sens1-Sens8 (default Sens1)."
+            "IC6: primary CH plus checked CH1-CH8 curves. SQC-310: Sens1-Sens8 (default Sens1)."
         )
+
+    def get_selected_ic6_channels(self):
+        channels = [idx + 1 for idx, chk in enumerate(self.chk_ic6_channels) if chk.isChecked()]
+        primary = self.combo_replay_channel.currentIndex() + 1
+        if primary not in channels:
+            channels.insert(0, primary)
+        return channels or [primary]
+
+    def make_channel_store(self):
+        return {
+            "time": deque(maxlen=100000),
+            "abs_time": deque(maxlen=100000),
+            "raw": deque(maxlen=100000),
+            "shift": deque(maxlen=100000),
+            "thick": deque(maxlen=100000),
+            "rate": deque(maxlen=100000),
+            "f0": None,
+            "last_rate": 0.0,
+        }
 
     def select_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Log", "", "QCM Logs (*.txt *.csv);;Txt (*.txt);;CSV (*.csv);;All (*)")
@@ -1212,9 +1246,11 @@ class QCMApp(QWidget):
                 if not path: return
                 replay_channel = self.combo_replay_channel.currentIndex() + 1
                 replay_format = self.combo_replay_format.currentText()
+                ic6_channels = self.get_selected_ic6_channels()
                 sqc_sensor = 1 if replay_format == "SQC-310" and replay_channel == 6 else replay_channel
                 self.ds = AutoQCMFileReplay(path, ic6_channel=replay_channel,
-                                            sqc_sensor=sqc_sensor, file_format=replay_format)
+                                            sqc_sensor=sqc_sensor, file_format=replay_format,
+                                            ic6_channels=ic6_channels)
             elif src_id == 3:
                 ip = self.input_ip.text();
                 port = int(self.input_port.text())
@@ -1242,6 +1278,8 @@ class QCMApp(QWidget):
             self.plot_dirty = False
             self.last_plot_refresh_time = 0.0
             self.rate_region_initialized = False
+            self.qcm_channel_data.clear()
+            self.clear_channel_curves()
             self.current_qcm_source_format = "live"
             self.current_qcm_channel = 1
             self.update_deposition_stats()
@@ -1300,6 +1338,45 @@ class QCMApp(QWidget):
     def on_worker_error(self, msg):
         self.stop_experiment(); QMessageBox.warning(self, "Error", msg)
 
+    def clear_channel_curves(self):
+        for curves in self.channel_curves.values():
+            for curve in curves.values():
+                try:
+                    curve.setData([], [])
+                except Exception:
+                    pass
+        self.channel_curves.clear()
+
+    def ensure_channel_curves(self, channel):
+        if channel in self.channel_curves:
+            return self.channel_curves[channel]
+        color = pg.intColor(channel - 1, hues=8)
+        pen = pg.mkPen(color, width=1.5)
+        curves = {
+            "freq": self.plot_f.plot(pen=pen, name=f"CH{channel}"),
+            "thick": self.plot_t.plot(pen=pen, name=f"CH{channel}"),
+            "rate": self.plot_r.plot(pen=pen, name=f"CH{channel}"),
+        }
+        self.channel_curves[channel] = curves
+        return curves
+
+    def update_ic6_channel_plots(self, x_is_absolute):
+        active_channels = set(self.qcm_channel_data)
+        for channel in list(self.channel_curves):
+            if channel not in active_channels:
+                for curve in self.channel_curves[channel].values():
+                    curve.setData([], [])
+                del self.channel_curves[channel]
+        for channel, store in self.qcm_channel_data.items():
+            curves = self.ensure_channel_curves(channel)
+            x_data = list(store["abs_time"] if x_is_absolute else store["time"])
+            if self.chk_raw_freq.isChecked():
+                curves["freq"].setData(x_data, list(store["raw"]))
+            else:
+                curves["freq"].setData(x_data, list(store["shift"]))
+            curves["thick"].setData(x_data, list(store["thick"]))
+            curves["rate"].setData(x_data, list(store["rate"]))
+
     def refresh_plots(self):
         if not self.time_data: return
         self.plot_dirty = False
@@ -1313,8 +1390,36 @@ class QCMApp(QWidget):
             if self.freq_data: self.plot_f.enableAutoRange(axis='y')
         self.curve_t.setData(x_data, list(self.thick_data))
         self.curve_r.setData(x_data, list(self.rate_data))
+        self.update_ic6_channel_plots(self.chk_abs_time.isChecked())
         self.update_epd_plot()
         self.update_deposition_stats()
+
+    def update_ic6_channel_data(self, now_ts, t_rel, metadata):
+        if metadata.get("source_format") != "IC6" or not metadata.get("frequencies"):
+            return
+        selected_channels = metadata.get("selected_channels") or [metadata.get("channel", 6)]
+        frequencies = metadata.get("frequencies")
+        for channel in selected_channels:
+            if channel < 1 or channel > len(frequencies):
+                continue
+            store = self.qcm_channel_data.setdefault(channel, self.make_channel_store())
+            raw_f = frequencies[channel - 1]
+            if store["f0"] is None:
+                store["f0"] = raw_f
+            delta_f = raw_f - store["f0"]
+            thick = qcm_calc.freq_to_thickness(delta_f, self.material_name)
+            store["abs_time"].append(now_ts)
+            store["time"].append(t_rel)
+            store["raw"].append(raw_f)
+            store["shift"].append(delta_f)
+            store["thick"].append(thick)
+            raw_rate = qcm_calc.calc_rate(list(store["time"])[-60:], list(store["thick"])[-60:], window=60)
+            if len(store["rate"]) == 0:
+                smooth_rate = raw_rate
+            else:
+                smooth_rate = 0.2 * raw_rate + 0.8 * store["last_rate"]
+            store["last_rate"] = smooth_rate
+            store["rate"].append(smooth_rate)
 
     def process_chunk(self, data_list):
         for data in data_list:
@@ -1329,6 +1434,7 @@ class QCMApp(QWidget):
                 "sensor_rates": data.get("sensor_rates"),
                 "sensor_thicknesses": data.get("sensor_thicknesses"),
                 "sensor_frequencies": data.get("sensor_frequencies"),
+                "selected_channels": data.get("selected_channels", []),
             }
             self.current_qcm_source_format = metadata["source_format"]
             self.current_qcm_channel = metadata["channel"]
@@ -1351,6 +1457,7 @@ class QCMApp(QWidget):
                 smooth_rate = alpha * raw_rate + (1 - alpha) * self.last_smooth_rate
             self.last_smooth_rate = smooth_rate
             self.rate_data.append(smooth_rate)
+            self.update_ic6_channel_data(now_ts, t_rel, metadata)
             self.write_csv_row(now_ts, t_rel, raw_f, delta_f, thick, smooth_rate, metadata)
             self.upload_grafana_row(now_ts, raw_f, delta_f, thick, smooth_rate)
 

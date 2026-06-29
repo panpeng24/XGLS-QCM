@@ -49,9 +49,10 @@ class IC6TxtReplay(QCMDataSource):
     DATE_COL = 17
     TIME_COL = 18
 
-    def __init__(self, txt_file, channel=6):
+    def __init__(self, txt_file, channel=6, channels=None):
         self.txt_file = txt_file
-        self.channel = self._normalize_channel(channel)
+        self.channels = self._normalize_channels(channels if channels is not None else [channel])
+        self.channel = self.channels[0]
         self.rows = []
         self.index = 0
 
@@ -62,6 +63,15 @@ class IC6TxtReplay(QCMDataSource):
         except (TypeError, ValueError):
             channel = 6
         return min(max(channel, 1), cls.CHANNEL_COUNT)
+
+    @classmethod
+    def _normalize_channels(cls, channels):
+        normalized = []
+        for channel in channels or [6]:
+            channel = cls._normalize_channel(channel)
+            if channel not in normalized:
+                normalized.append(channel)
+        return normalized or [6]
 
     @classmethod
     def _parse_ic6_row(cls, cols):
@@ -87,7 +97,8 @@ class IC6TxtReplay(QCMDataSource):
                     if parsed is not None:
                         self.rows.append(parsed)
             self.index = 0
-            print(f"[IC6 File] Loaded {len(self.rows)} points from CH{self.channel}.")
+            channel_text = ",".join(f"CH{ch}" for ch in self.channels)
+            print(f"[IC6 File] Loaded {len(self.rows)} points from {channel_text}.")
         except FileNotFoundError:
             raise FileNotFoundError(f"Cannot find file: {self.txt_file}")
 
@@ -102,6 +113,7 @@ class IC6TxtReplay(QCMDataSource):
             "frequency": row["frequencies"][selected_index],
             "source_format": "IC6",
             "channel": self.channel,
+            "selected_channels": self.channels,
             "frequencies": row["frequencies"],
             "active_values": row["active_values"],
         }
@@ -173,6 +185,15 @@ class SQC310CSVReplay(QCMDataSource):
                 frequencies.append(0.0)
         return rates, thicknesses, frequencies
 
+    @staticmethod
+    def _first_valid_frequency(frequencies, preferred_index=0):
+        if 0 <= preferred_index < len(frequencies) and frequencies[preferred_index] > 0:
+            return frequencies[preferred_index]
+        for frequency in frequencies:
+            if frequency > 0:
+                return frequency
+        return None
+
     def _parse_data_row(self, row):
         if len(row) < 3:
             return None
@@ -186,9 +207,14 @@ class SQC310CSVReplay(QCMDataSource):
         rate_idx = self._header_index(self.header, f"Sens{self.sensor}Rate") if self.header else None
         thk_idx = self._header_index(self.header, f"Sens{self.sensor}Thk") if self.header else None
 
+        selected_freq = None
         try:
             selected_freq = self._to_float(row[freq_idx]) if freq_idx is not None else sensor_frequencies[self.sensor - 1]
         except (ValueError, IndexError):
+            pass
+        if selected_freq is None or selected_freq == 0.0:
+            selected_freq = self._first_valid_frequency(sensor_frequencies, preferred_index=self.sensor - 1)
+        if selected_freq is None:
             return None
 
         selected_rate = None
@@ -256,9 +282,10 @@ class SQC310CSVReplay(QCMDataSource):
 
 
 class AutoQCMFileReplay(QCMDataSource):
-    def __init__(self, file_path, ic6_channel=6, sqc_sensor=1, file_format="Auto"):
+    def __init__(self, file_path, ic6_channel=6, sqc_sensor=1, file_format="Auto", ic6_channels=None):
         self.file_path = file_path
         self.ic6_channel = ic6_channel
+        self.ic6_channels = IC6TxtReplay._normalize_channels(ic6_channels if ic6_channels is not None else [ic6_channel])
         self.sqc_sensor = sqc_sensor
         self.file_format = file_format
         self.delegate = None
@@ -281,7 +308,7 @@ class AutoQCMFileReplay(QCMDataSource):
             sensor = 1 if self.file_format == "Auto" and int(self.sqc_sensor) == 6 else self.sqc_sensor
             self.delegate = SQC310CSVReplay(self.file_path, sensor=sensor)
         else:
-            self.delegate = IC6TxtReplay(self.file_path, channel=self.ic6_channel)
+            self.delegate = IC6TxtReplay(self.file_path, channel=self.ic6_channel, channels=self.ic6_channels)
         self.delegate.connect()
 
     def disconnect(self):

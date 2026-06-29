@@ -155,3 +155,10 @@ Use **Replay Format** in the GUI to choose `Auto`, `IC6`, or `SQC-310`:
 - `SQC-310` reads the start date/time line, uses the first CSV column as elapsed seconds, and reads `SensNRate`, `SensNThk`, and `SensNFreq` data from the sensor section. The selected sensor frequency is used as the raw QCM frequency for the existing thickness/rate pipeline.
 
 Saved QCM CSV output includes `Source_Format`, `QCM_Channel`, SQC `Phase`, all IC6 channel columns, and SQC sensor rate/thickness/frequency columns so replay exports can be reused for future multi-channel analysis.
+
+### v4.5 replay improvements
+
+Version v4.5 improves replay compatibility in two areas:
+
+- **SQC-310**: the parser reads the `Start:` date/time line, uses the first CSV column as elapsed seconds, finds the `Sensors:` section in each data row, and takes each sensor group as `Rate, Thk, Freq`. If the selected SQC sensor has a zero/empty frequency, the parser falls back to the first valid non-zero sensor frequency so rows like `Sens1Freq=5964243.070` are still decoded and sent into the normal QCM thickness/rate calculations.
+- **IC6**: `CH1` through `CH8` can be checked independently or together. The selected primary channel is still used for the main statistics/export path, while all checked IC6 channels are calculated and plotted on the same synchronized time axis for frequency, thickness, and rate comparison.
