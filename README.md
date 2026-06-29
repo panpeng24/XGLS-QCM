@@ -76,3 +76,82 @@ MATERIALS_DB	dict	材料密度数据库，key 为材料简称，value 包含密�
 Tooling Factor 校准：需根据实际镀膜工艺校准（实际厚度 / 监测厚度），是提升厚度计算精度的关键；
 碳膜密度：蒸发碳膜密度通常在 1.8-2.25 g/cm³ 之间，默认取石墨标准值 2.25，可根据实验需求调整；
 稳态判断阈值：需根据具体工艺场景调整（如高精度镀膜可设为 0.5 Hz/min，粗镀膜可设为 2.0 Hz/min）。
+
+## Troubleshooting: `SyntaxError` on a line starting with `@@` or a hash
+
+If Python reports an error like either of these:
+
+```text
+SyntaxError: invalid syntax
+@@ -99,117 +100,120 @@ class QCMWorker(QThread):
+```
+
+```text
+SyntaxError: invalid syntax
+dc9ceaaf753ae1809d0f715fae5b.
+```
+
+then a unified-diff patch hunk, PR text, or commit/hash fragment was copied into
+`main.py` as plain text. Lines that start with `@@`, `diff --git`, `<<<<<<<`,
+`=======`, `>>>>>>>`, or a standalone hash are not Python code and must not appear
+in the source file.
+
+To check the repository copy before running the GUI:
+
+```bash
+python tools/check_source_integrity.py
+python -m py_compile main.py
+```
+
+If the check reports an artifact, remove that line or replace the affected file
+with the clean version from this repository. Apply changes with `git apply` or
+`git pull` instead of copy-pasting PR/diff text or commit hashes into `main.py`.
+
+## Real-time Grafana dashboard export
+
+The GUI can stream calculated QCM data to Grafana through an InfluxDB v2 data
+source. Start InfluxDB, create a bucket (for example `qcm`) and an API token,
+then add that InfluxDB instance as a Grafana data source.
+
+In the QCM GUI:
+
+1. Enable **Upload to Grafana (InfluxDB)**.
+2. Fill in the InfluxDB URL, Org, Bucket, and API Token.
+3. Start acquisition or file replay.
+
+The GUI includes dashboard presets for multiple tools:
+
+```text
+LRP P2: http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1
+LDP P1: http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/ldp-p1?orgId=1&from=now-6h&to=now
+```
+
+Note that these Grafana URLs open dashboards only; real-time data must still be
+written to the InfluxDB data source configured behind each dashboard.
+
+The app writes measurement `qcm` with tags `material` and `platform`, and fields:
+
+- `frequency_raw_hz`
+- `frequency_shift_hz`
+- `thickness_nm`
+- `rate_a_s`
+
+Example Flux query in Grafana:
+
+```flux
+from(bucket: "qcm")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "qcm")
+  |> filter(fn: (r) => r._field == "thickness_nm" or r._field == "rate_a_s")
+```
+
+## File replay formats: IC6 and SQC-310
+
+The File Replay input supports both legacy IC6 datalogs and SQC-310 CSV datalogs.
+Use **Replay Format** in the GUI to choose `Auto`, `IC6`, or `SQC-310`:
+
+- `Auto` inspects the file header and detects SQC-310 logs from `Start:`, `Sens1Freq`, or SQC markers; otherwise it falls back to IC6 parsing.
+- `IC6` reads the 8 frequency channels and 8 crystal activity values. The default selector is `CH6` to preserve the previous behavior.
+- `SQC-310` reads the start date/time line, uses the first CSV column as elapsed seconds, and reads `SensNRate`, `SensNThk`, and `SensNFreq` data from the sensor section. The selected sensor frequency is used as the raw QCM frequency for the existing thickness/rate pipeline.
+
+Saved QCM CSV output includes `Source_Format`, `QCM_Channel`, SQC `Phase`, all IC6 channel columns, and SQC sensor rate/thickness/frequency columns so replay exports can be reused for future multi-channel analysis.

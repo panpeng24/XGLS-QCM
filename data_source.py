@@ -1,6 +1,7 @@
 import time
 import random
 import socket
+import csv
 from datetime import datetime
 
 
@@ -39,41 +40,258 @@ class MockQCMStream(QCMDataSource):
 
 
 # ---------------------------------------------------------
-# 2. 文件回放 (已优化：移除 sleep)
+# 2. 文件回放 (IC6 / SQC-310)
 # ---------------------------------------------------------
 class IC6TxtReplay(QCMDataSource):
-    def __init__(self, txt_file):
+    CHANNEL_COUNT = 8
+    FREQ_START_COL = 1
+    ACTIVE_START_COL = 9
+    DATE_COL = 17
+    TIME_COL = 18
+
+    def __init__(self, txt_file, channel=6):
         self.txt_file = txt_file
+        self.channel = self._normalize_channel(channel)
         self.rows = []
         self.index = 0
 
+    @classmethod
+    def _normalize_channel(cls, channel):
+        try:
+            channel = int(channel)
+        except (TypeError, ValueError):
+            channel = 6
+        return min(max(channel, 1), cls.CHANNEL_COUNT)
+
+    @classmethod
+    def _parse_ic6_row(cls, cols):
+        if len(cols) < cls.TIME_COL + 1:
+            return None
+        try:
+            frequencies = [float(cols[cls.FREQ_START_COL + i]) for i in range(cls.CHANNEL_COUNT)]
+            active_values = [float(cols[cls.ACTIVE_START_COL + i]) for i in range(cls.CHANNEL_COUNT)]
+            ts = datetime.strptime(f"{cols[cls.DATE_COL]} {cols[cls.TIME_COL]}", "%m/%d/%Y %H:%M:%S").timestamp()
+        except (ValueError, IndexError):
+            return None
+        return {"ts": ts, "frequencies": frequencies, "active_values": active_values}
+
     def connect(self):
         self.rows = []
-        print(f"[File] Loading {self.txt_file}...")
+        print(f"[IC6 File] Loading {self.txt_file}...")
         try:
             with open(self.txt_file, "r", encoding="utf-8", errors='ignore') as f:
                 for line in f:
-                    if line.startswith("IC6") or not line.strip(): continue
-                    cols = line.split()
-                    if len(cols) < 19: continue
-                    try:
-                        freq = float(cols[6])
-                        ts = datetime.strptime(f"{cols[17]} {cols[18]}", "%m/%d/%Y %H:%M:%S").timestamp()
-                        self.rows.append({"ts": ts, "f": freq})
-                    except:
+                    if line.startswith("IC6") or not line.strip():
                         continue
+                    parsed = self._parse_ic6_row(line.split())
+                    if parsed is not None:
+                        self.rows.append(parsed)
             self.index = 0
-            print(f"[File] Loaded {len(self.rows)} points.")
+            print(f"[IC6 File] Loaded {len(self.rows)} points from CH{self.channel}.")
         except FileNotFoundError:
             raise FileNotFoundError(f"Cannot find file: {self.txt_file}")
 
     def read(self):
-        # --- 极速模式：不再在此处 Sleep ---
-        if self.index >= len(self.rows): return None
+        if self.index >= len(self.rows):
+            return None
         row = self.rows[self.index]
         self.index += 1
-        return {"timestamp": row["ts"], "frequency": row["f"]}
+        selected_index = self.channel - 1
+        return {
+            "timestamp": row["ts"],
+            "frequency": row["frequencies"][selected_index],
+            "source_format": "IC6",
+            "channel": self.channel,
+            "frequencies": row["frequencies"],
+            "active_values": row["active_values"],
+        }
 
+
+class SQC310CSVReplay(QCMDataSource):
+    SENSOR_COUNT = 8
+
+    def __init__(self, csv_file, sensor=1):
+        self.csv_file = csv_file
+        self.sensor = self._normalize_sensor(sensor)
+        self.rows = []
+        self.index = 0
+        self.start_ts = None
+        self.header = []
+
+    @classmethod
+    def _normalize_sensor(cls, sensor):
+        try:
+            sensor = int(sensor)
+        except (TypeError, ValueError):
+            sensor = 1
+        return min(max(sensor, 1), cls.SENSOR_COUNT)
+
+    @staticmethod
+    def _parse_start_line(line):
+        if "Start:" not in line or "Date:" not in line or "Time:" not in line:
+            return None
+        parts = line.replace("Start:", "").replace("Date:", " Date: ").replace("Time:", " Time: ").split()
+        try:
+            date_text = parts[parts.index("Date:") + 1]
+            time_text = parts[parts.index("Time:") + 1]
+            return datetime.strptime(f"{date_text} {time_text}", "%Y/%m/%d %H:%M:%S").timestamp()
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _to_float(value):
+        return float(str(value).strip())
+
+    @staticmethod
+    def _header_index(header, name):
+        target = name.lower()
+        for idx, col in enumerate(header):
+            if col.strip().lower() == target:
+                return idx
+        return None
+
+    @classmethod
+    def _extract_sensor_groups(cls, row):
+        stripped = [col.strip() for col in row]
+        try:
+            marker = next(i for i, col in enumerate(stripped) if col.lower().startswith("sensors"))
+        except StopIteration:
+            return [], [], []
+        rates, thicknesses, frequencies = [], [], []
+        start = marker + 1
+        for sensor_idx in range(cls.SENSOR_COUNT):
+            base = start + sensor_idx * 3
+            if base + 2 >= len(stripped):
+                break
+            try:
+                rates.append(cls._to_float(stripped[base]))
+                thicknesses.append(cls._to_float(stripped[base + 1]))
+                frequencies.append(cls._to_float(stripped[base + 2]))
+            except ValueError:
+                rates.append(0.0)
+                thicknesses.append(0.0)
+                frequencies.append(0.0)
+        return rates, thicknesses, frequencies
+
+    def _parse_data_row(self, row):
+        if len(row) < 3:
+            return None
+        try:
+            elapsed_s = self._to_float(row[0])
+        except ValueError:
+            return None
+
+        sensor_rates, sensor_thicknesses, sensor_frequencies = self._extract_sensor_groups(row)
+        freq_idx = self._header_index(self.header, f"Sens{self.sensor}Freq") if self.header else None
+        rate_idx = self._header_index(self.header, f"Sens{self.sensor}Rate") if self.header else None
+        thk_idx = self._header_index(self.header, f"Sens{self.sensor}Thk") if self.header else None
+
+        try:
+            selected_freq = self._to_float(row[freq_idx]) if freq_idx is not None else sensor_frequencies[self.sensor - 1]
+        except (ValueError, IndexError):
+            return None
+
+        selected_rate = None
+        selected_thickness = None
+        try:
+            selected_rate = self._to_float(row[rate_idx]) if rate_idx is not None else sensor_rates[self.sensor - 1]
+            selected_thickness = self._to_float(row[thk_idx]) if thk_idx is not None else sensor_thicknesses[self.sensor - 1]
+        except (ValueError, IndexError):
+            pass
+
+        ts = (self.start_ts + elapsed_s) if self.start_ts is not None else elapsed_s
+        return {
+            "ts": ts,
+            "elapsed_s": elapsed_s,
+            "frequency": selected_freq,
+            "sensor_rates": sensor_rates,
+            "sensor_thicknesses": sensor_thicknesses,
+            "sensor_frequencies": sensor_frequencies,
+            "selected_rate": selected_rate,
+            "selected_thickness": selected_thickness,
+            "phase": row[1].strip() if len(row) > 1 else "",
+        }
+
+    def connect(self):
+        self.rows = []
+        self.header = []
+        self.start_ts = None
+        print(f"[SQC-310 File] Loading {self.csv_file}...")
+        try:
+            with open(self.csv_file, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+                for raw_line in f:
+                    if self.start_ts is None:
+                        self.start_ts = self._parse_start_line(raw_line)
+                    if raw_line.lstrip().lower().startswith("time,"):
+                        self.header = [col.strip() for col in next(csv.reader([raw_line]))]
+                        break
+                reader = csv.reader(f)
+                for row in reader:
+                    parsed = self._parse_data_row(row)
+                    if parsed is not None:
+                        self.rows.append(parsed)
+            self.index = 0
+            print(f"[SQC-310 File] Loaded {len(self.rows)} points from Sens{self.sensor}.")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Cannot find file: {self.csv_file}")
+
+    def read(self):
+        if self.index >= len(self.rows):
+            return None
+        row = self.rows[self.index]
+        self.index += 1
+        return {
+            "timestamp": row["ts"],
+            "elapsed_s": row["elapsed_s"],
+            "frequency": row["frequency"],
+            "source_format": "SQC-310",
+            "channel": self.sensor,
+            "phase": row["phase"],
+            "sensor_rates": row["sensor_rates"],
+            "sensor_thicknesses": row["sensor_thicknesses"],
+            "sensor_frequencies": row["sensor_frequencies"],
+            "selected_sensor_rate": row["selected_rate"],
+            "selected_sensor_thickness": row["selected_thickness"],
+        }
+
+
+class AutoQCMFileReplay(QCMDataSource):
+    def __init__(self, file_path, ic6_channel=6, sqc_sensor=1, file_format="Auto"):
+        self.file_path = file_path
+        self.ic6_channel = ic6_channel
+        self.sqc_sensor = sqc_sensor
+        self.file_format = file_format
+        self.delegate = None
+
+    def _detect_format(self):
+        if self.file_format in ("IC6", "SQC-310"):
+            return self.file_format
+        try:
+            with open(self.file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                sample = "".join(f.readline() for _ in range(20)).lower()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Cannot find file: {self.file_path}")
+        if "sqc" in sample or "sens1freq" in sample or "start:" in sample:
+            return "SQC-310"
+        return "IC6"
+
+    def connect(self):
+        detected = self._detect_format()
+        if detected == "SQC-310":
+            sensor = 1 if self.file_format == "Auto" and int(self.sqc_sensor) == 6 else self.sqc_sensor
+            self.delegate = SQC310CSVReplay(self.file_path, sensor=sensor)
+        else:
+            self.delegate = IC6TxtReplay(self.file_path, channel=self.ic6_channel)
+        self.delegate.connect()
+
+    def disconnect(self):
+        if self.delegate:
+            self.delegate.disconnect()
+
+    def read(self):
+        if not self.delegate:
+            return None
+        return self.delegate.read()
 
 # ---------------------------------------------------------
 # 3. 以太网客户端

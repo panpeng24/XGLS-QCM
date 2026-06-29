@@ -3,6 +3,12 @@ import time
 import csv
 import os
 from datetime import datetime
+import math
+import queue
+import threading
+import urllib.parse
+import urllib.request
+import webbrowser
 from collections import deque
 from bisect import bisect_left
 
@@ -22,7 +28,7 @@ import pyqtgraph as pg
 # ==========================================
 try:
     from model import qcm_calc, MATERIALS_DB
-    from data_source import MockQCMStream, IC6TxtReplay, EthernetQCMClient
+    from data_source import MockQCMStream, AutoQCMFileReplay, EthernetQCMClient
     # [新增] 导入报告生成模块
     from report_module import StandardReportGenerator
 except ImportError as e:
@@ -33,6 +39,90 @@ except ImportError as e:
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 pg.setConfigOption('antialias', True)
+
+
+# ==========================================
+# Grafana / InfluxDB 上传器
+# ==========================================
+class GrafanaInfluxUploader:
+    def __init__(self, base_url, org, bucket, token, measurement="qcm"):
+        self.base_url = base_url.rstrip("/")
+        self.org = org.strip()
+        self.bucket = bucket.strip()
+        self.token = token.strip()
+        self.measurement = measurement.strip() or "qcm"
+        self.queue = queue.Queue(maxsize=10000)
+        self.running = True
+        self.last_error = ""
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def escape_tag(value):
+        return str(value).replace(" ", "\\ ").replace(",", "\\,").replace("=", "\\=")
+
+    @staticmethod
+    def format_field(value):
+        if isinstance(value, str):
+            return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        return f"{float(value):.12g}"
+
+    def build_line(self, fields, tags, timestamp_s):
+        tag_part = "".join(f",{self.escape_tag(k)}={self.escape_tag(v)}" for k, v in tags.items() if v != "")
+        field_part = ",".join(f"{self.escape_tag(k)}={self.format_field(v)}" for k, v in fields.items())
+        timestamp_ns = int(timestamp_s * 1_000_000_000)
+        return f"{self.escape_tag(self.measurement)}{tag_part} {field_part} {timestamp_ns}"
+
+    def enqueue(self, fields, tags, timestamp_s):
+        if not self.running:
+            return
+        line = self.build_line(fields, tags, timestamp_s)
+        try:
+            self.queue.put_nowait(line)
+        except queue.Full:
+            # Drop oldest data rather than blocking the GUI.
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(line)
+            except queue.Full:
+                pass
+
+    def _write_batch(self, lines):
+        params = urllib.parse.urlencode({"org": self.org, "bucket": self.bucket, "precision": "ns"})
+        url = f"{self.base_url}/api/v2/write?{params}"
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        if self.token:
+            headers["Authorization"] = f"Token {self.token}"
+        req = urllib.request.Request(url, data=("\n".join(lines)).encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            resp.read()
+
+    def _run(self):
+        buffer = []
+        last_flush = time.monotonic()
+        while self.running or not self.queue.empty():
+            timeout = max(0.0, 1.0 - (time.monotonic() - last_flush))
+            try:
+                line = self.queue.get(timeout=timeout)
+                buffer.append(line)
+            except queue.Empty:
+                pass
+            if buffer and (len(buffer) >= 200 or time.monotonic() - last_flush >= 1.0 or not self.running):
+                try:
+                    self._write_batch(buffer)
+                    self.last_error = ""
+                    buffer = []
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    buffer = []
+                last_flush = time.monotonic()
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=5)
 
 
 # ==========================================
@@ -121,7 +211,9 @@ class QCMWorker(QThread):
                 if not self.is_file_replay:
                     self.msleep(10)
                 else:
-                    if self.speed < 100: self.msleep(5)
+                    # Yield between replay chunks so the GUI event loop can repaint
+                    # instead of waiting for a click or for replay completion.
+                    self.msleep(10)
 
             except Exception as e:
                 self.error_signal.emit(str(e))
@@ -170,8 +262,14 @@ class QCMApp(QWidget):
         self.ds = None
         self.f0 = None
         self.start_ts = None
-        self.material_name = "Sn"
+        self.material_name = "InSn"
         self.last_smooth_rate = 0.0
+        self.plot_dirty = False
+        self.last_plot_refresh_time = 0.0
+        self.csv_file = None
+        self.csv_writer = None
+        self.grafana_uploader = None
+        self.rate_region_initialized = False
 
         # 数据容器
         MAX_LEN = 100000
@@ -181,13 +279,16 @@ class QCMApp(QWidget):
         self.raw_freq_data = deque(maxlen=MAX_LEN)  # Raw
         self.thick_data = deque(maxlen=MAX_LEN)
         self.rate_data = deque(maxlen=MAX_LEN)
+        self.epd_time_data = []
+        self.epd_current_data = []
+        self.epd_time_is_absolute = False
 
         self.plot_timer = QTimer()
         self.plot_timer.setInterval(33)
         self.plot_timer.timeout.connect(self.refresh_plots)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.setInterval(1000)
-        self.auto_refresh_timer.timeout.connect(self.refresh_plots)
+        self.auto_refresh_timer.timeout.connect(self.on_auto_refresh_tick)
 
         self.init_ui()
 
@@ -219,6 +320,20 @@ class QCMApp(QWidget):
         l_f.addWidget(self.input_file_path);
         l_f.addWidget(self.btn_browse)
 
+        self.widget_file_options = QWidget()
+        f_file_options = QFormLayout(self.widget_file_options)
+        f_file_options.setContentsMargins(0, 0, 0, 0)
+        self.combo_replay_format = QComboBox()
+        self.combo_replay_format.addItems(["Auto", "IC6", "SQC-310"])
+        self.combo_replay_format.setToolTip("Auto detects IC6 whitespace datalog or SQC-310 CSV datalog from the file header.")
+        self.combo_replay_channel = QComboBox()
+        self.combo_replay_channel.addItems([f"CH{i}" for i in range(1, 9)])
+        self.combo_replay_channel.setCurrentText("CH6")
+        self.combo_replay_channel.setToolTip("IC6 uses CH1-CH8 and defaults to CH6. SQC-310 uses the same selector as Sens1-Sens8 and defaults to Sens1 when SQC-310 is selected.")
+        self.combo_replay_format.currentTextChanged.connect(self.on_replay_format_changed)
+        f_file_options.addRow("Replay Format:", self.combo_replay_format)
+        f_file_options.addRow("Channel/Sensor:", self.combo_replay_channel)
+
         self.widget_net = QWidget()
         f_net = QFormLayout(self.widget_net);
         f_net.setContentsMargins(0, 0, 0, 0)
@@ -233,6 +348,7 @@ class QCMApp(QWidget):
         vb_source.addWidget(self.rb_mock);
         vb_source.addWidget(self.rb_file);
         vb_source.addWidget(self.widget_file)
+        vb_source.addWidget(self.widget_file_options)
         vb_source.addWidget(self.rb_net);
         vb_source.addWidget(self.widget_net)
         gb_source.setLayout(vb_source)
@@ -242,7 +358,7 @@ class QCMApp(QWidget):
         f_param = QFormLayout()
         self.combo_mat = QComboBox();
         self.combo_mat.addItems(MATERIALS_DB.keys());
-        self.combo_mat.setCurrentText("Sn")
+        self.combo_mat.setCurrentText("InSn")
         self.combo_mat.currentTextChanged.connect(self.on_material_changed)
 
         self.widget_tooling_container = QWidget()
@@ -297,6 +413,7 @@ class QCMApp(QWidget):
         # 平台选择 (Section 1)
         self.combo_platform = QComboBox()
         self.combo_platform.addItems(["DPP (Discharge)", "LRP (Laser)", "LDP (Hybrid)"])
+        self.combo_platform.setCurrentText("LRP (Laser)")
         self.combo_platform.setToolTip("选择光源平台类型 (Section 1)")
 
         # 台阶仪校准 (Section 11)
@@ -328,8 +445,69 @@ class QCMApp(QWidget):
         f_report.addRow(self.btn_gen_report)
         gb_report.setLayout(f_report)
 
-        # --- D. 基础记录控制 ---
-        gb_ctrl = QGroupBox("4. Control")
+        # --- D. 沉积统计 ---
+        gb_stats = QGroupBox("4. Deposition Statistics")
+        gb_stats.setCheckable(True)
+        gb_stats.setChecked(False)
+        gb_stats.setToolTip("勾选标题展开/折叠沉积统计与 EPD 设置，减少左侧控制面板占用空间。")
+        v_stats = QVBoxLayout()
+        self.widget_stats_content = QWidget()
+        f_stats = QFormLayout(self.widget_stats_content)
+        f_stats.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_ref_area = QDoubleSpinBox()
+        self.spin_ref_area.setRange(0.000001, 1000000.0)
+        self.spin_ref_area.setDecimals(4)
+        self.spin_ref_area.setValue(1.0)
+        self.spin_ref_area.setSuffix(" cm²")
+        self.spin_ref_area.setToolTip("参考样品/沉积区域面积；Total Mass (Ref) 和 ng/s 按此面积换算。")
+        self.spin_ref_area.valueChanged.connect(self.update_deposition_stats)
+
+        self.lbl_stat_time = QLabel("--")
+        self.lbl_stat_mass_density = QLabel("--")
+        self.lbl_stat_total_mass = QLabel("--")
+        self.lbl_stat_avg_rate_a = QLabel("--")
+        self.lbl_stat_avg_rate_ng = QLabel("--")
+        self.lbl_rate_region_mean = QLabel("--")
+        self.lbl_rate_region_std = QLabel("--")
+        self.lbl_epd_decay = QLabel("--")
+        self.widget_epd_path = QWidget()
+        layout_epd = QHBoxLayout(self.widget_epd_path)
+        layout_epd.setContentsMargins(0, 0, 0, 0)
+        self.input_epd_path = QLineEdit()
+        self.input_epd_path.setPlaceholderText("EPD CSV: time,current_nA")
+        self.btn_epd_browse = QPushButton("...")
+        self.btn_epd_browse.setFixedWidth(30)
+        self.btn_epd_browse.clicked.connect(self.select_epd_file)
+        layout_epd.addWidget(self.input_epd_path)
+        layout_epd.addWidget(self.btn_epd_browse)
+        for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
+                    self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
+                    self.lbl_rate_region_mean, self.lbl_rate_region_std, self.lbl_epd_decay]:
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setStyleSheet("background: #fafafa; border: 1px solid #ddd; padding: 3px;")
+
+        f_stats.addRow("Ref Area:", self.spin_ref_area)
+        f_stats.addRow("Time:", self.lbl_stat_time)
+        f_stats.addRow("Mass density @ QCM:", self.lbl_stat_mass_density)
+        f_stats.addRow("Total Mass (Ref):", self.lbl_stat_total_mass)
+        f_stats.addRow("Average rate (Å/s):", self.lbl_stat_avg_rate_a)
+        f_stats.addRow("Average rate (ng/s):", self.lbl_stat_avg_rate_ng)
+        f_stats.addRow("EPD Data:", self.widget_epd_path)
+        f_stats.addRow("Rate ROI mean:", self.lbl_rate_region_mean)
+        f_stats.addRow("Rate ROI std:", self.lbl_rate_region_std)
+        f_stats.addRow("EPD decay:", self.lbl_epd_decay)
+        v_stats.addWidget(self.widget_stats_content)
+        gb_stats.setLayout(v_stats)
+        self.widget_stats_content.setVisible(False)
+        gb_stats.toggled.connect(self.widget_stats_content.setVisible)
+        gb_stats.toggled.connect(lambda checked: gb_stats.setTitle(
+            "4. Deposition Statistics" if checked else "4. Deposition Statistics (collapsed)"
+        ))
+        gb_stats.setTitle("4. Deposition Statistics (collapsed)")
+
+        # --- E. 基础记录控制 ---
+        gb_ctrl = QGroupBox("5. Control")
         vb_ctrl = QVBoxLayout()
 
         self.chk_record = QCheckBox("Save QCM to CSV");
@@ -349,10 +527,40 @@ class QCMApp(QWidget):
         self.btn_save_img = QPushButton("Screenshot Graph");
         self.btn_save_img.clicked.connect(self.save_plots_as_image)
 
-        self.btn_auto_refresh = QPushButton("Auto Refresh: OFF (1s)")
+        self.btn_auto_refresh = QPushButton("Live Refresh: OFF (1s)")
         self.btn_auto_refresh.setCheckable(True)
-        self.btn_auto_refresh.setToolTip("每秒自动刷新曲线；文件回放模式下无需点击图表也会更新显示。")
+        self.btn_auto_refresh.setToolTip("每秒自动读取最新缓冲数据并刷新曲线；文件回放模式下无需点击图表也会更新显示。")
         self.btn_auto_refresh.toggled.connect(self.on_auto_refresh_toggled)
+
+        self.chk_grafana_upload = QCheckBox("Upload to Grafana (InfluxDB)")
+        self.chk_grafana_upload.setToolTip("实时写入 InfluxDB v2；Grafana 添加该 InfluxDB 数据源后即可做看板。")
+        self.widget_grafana = QWidget()
+        f_grafana = QFormLayout(self.widget_grafana)
+        f_grafana.setContentsMargins(0, 0, 0, 0)
+        self.input_influx_url = QLineEdit("http://localhost:8086")
+        self.input_influx_org = QLineEdit("qcm")
+        self.input_influx_bucket = QLineEdit("qcm")
+        self.input_influx_token = QLineEdit()
+        self.input_influx_token.setEchoMode(QLineEdit.Password)
+        self.input_influx_token.setPlaceholderText("InfluxDB API token")
+        self.grafana_dashboard_urls = {
+            "LRP P2": "http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1",
+            "LDP P1": "http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/ldp-p1?orgId=1&from=now-6h&to=now",
+        }
+        self.combo_grafana_dashboard = QComboBox()
+        self.combo_grafana_dashboard.addItems(self.grafana_dashboard_urls.keys())
+        self.combo_grafana_dashboard.currentTextChanged.connect(self.on_grafana_dashboard_changed)
+        self.input_grafana_dashboard = QLineEdit(self.grafana_dashboard_urls["LRP P2"])
+        self.input_grafana_dashboard.setToolTip("Grafana 看板页面地址；用于快速打开看板，不是数据写入接口。")
+        self.btn_open_grafana = QPushButton("Open Dashboard")
+        self.btn_open_grafana.clicked.connect(self.open_grafana_dashboard)
+        f_grafana.addRow("Influx URL:", self.input_influx_url)
+        f_grafana.addRow("Org:", self.input_influx_org)
+        f_grafana.addRow("Bucket:", self.input_influx_bucket)
+        f_grafana.addRow("Token:", self.input_influx_token)
+        f_grafana.addRow("Dashboard Preset:", self.combo_grafana_dashboard)
+        f_grafana.addRow("Dashboard URL:", self.input_grafana_dashboard)
+        f_grafana.addRow(self.btn_open_grafana)
 
         self.btn_start = QPushButton("START");
         self.btn_start.setStyleSheet("background: #2e7d32; color: white; padding: 10px; font-weight: bold;")
@@ -369,6 +577,8 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.widget_csv_path)
         vb_ctrl.addWidget(self.btn_save_img)
         vb_ctrl.addWidget(self.btn_auto_refresh)
+        vb_ctrl.addWidget(self.chk_grafana_upload)
+        vb_ctrl.addWidget(self.widget_grafana)
         vb_ctrl.addWidget(self.btn_start);
         vb_ctrl.addWidget(self.btn_stop);
         vb_ctrl.addWidget(self.lbl_status)
@@ -377,6 +587,7 @@ class QCMApp(QWidget):
         ctrl_panel.addWidget(gb_source);
         ctrl_panel.addWidget(gb_param)
         ctrl_panel.addWidget(gb_report);
+        ctrl_panel.addWidget(gb_stats);
         ctrl_panel.addWidget(gb_ctrl)  # [修改] 布局顺序
         ctrl_panel.addStretch()
 
@@ -409,6 +620,23 @@ class QCMApp(QWidget):
         self.curve_f = self.plot_f.plot(pen=pg.mkPen('k', width=2))
         self.curve_t = self.plot_t.plot(pen=pg.mkPen('r', width=2))
         self.curve_r = self.plot_r.plot(pen=pg.mkPen('b', width=2))
+        self.plot_r.plotItem.showAxis('right')
+        self.epd_axis = self.plot_r.plotItem.getAxis('right')
+        self.epd_axis.setLabel('EPD', units='nA')
+        self.epd_axis.setPen(pg.mkPen('g'))
+        self.epd_axis.show()
+        self.epd_view = pg.ViewBox()
+        self.plot_r.plotItem.scene().addItem(self.epd_view)
+        self.epd_axis.linkToView(self.epd_view)
+        self.epd_view.setXLink(self.plot_r)
+        self.curve_epd = pg.PlotDataItem(pen=pg.mkPen('g', width=2))
+        self.epd_view.addItem(self.curve_epd)
+        self.plot_r.plotItem.vb.sigResized.connect(self.update_epd_view_geometry)
+        self.update_epd_view_geometry()
+        self.rate_region = pg.LinearRegionItem([0, 10], brush=pg.mkBrush(33, 150, 243, 40))
+        self.rate_region.setZValue(10)
+        self.rate_region.sigRegionChanged.connect(self.update_rate_region_stats)
+        self.plot_r.addItem(self.rate_region)
         main_layout.addLayout(ctrl_panel, 1);
         main_layout.addWidget(self.plot_container, 4);
         self.setLayout(main_layout)
@@ -418,10 +646,19 @@ class QCMApp(QWidget):
     def on_source_changed(self, btn):
         sid = self.group_source.checkedId()
         self.widget_file.setVisible(sid == 2);
+        self.widget_file_options.setVisible(sid == 2)
         self.widget_net.setVisible(sid == 3)
 
+
+    def on_replay_format_changed(self, fmt):
+        if fmt == "SQC-310" and self.combo_replay_channel.currentText() == "CH6":
+            self.combo_replay_channel.setCurrentText("CH1")
+        self.combo_replay_channel.setToolTip(
+            "IC6: CH1-CH8 (default CH6). SQC-310: Sens1-Sens8 (default Sens1)."
+        )
+
     def select_file(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Select Log", "", "Txt (*.txt);;All (*)")
+        fname, _ = QFileDialog.getOpenFileName(self, "Select Log", "", "QCM Logs (*.txt *.csv);;Txt (*.txt);;CSV (*.csv);;All (*)")
         if fname: self.input_file_path.setText(fname)
 
     def select_save_csv(self):
@@ -433,6 +670,12 @@ class QCMApp(QWidget):
     def select_rga_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select RGA CSV", "", "CSV Files (*.csv);;All (*)")
         if fname: self.input_rga_path.setText(fname)
+
+    def select_epd_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select EPD CSV", "", "CSV Files (*.csv);;All (*)")
+        if fname:
+            self.input_epd_path.setText(fname)
+            self.load_epd_csv(fname)
 
     # [新增] 报告生成逻辑
     def generate_full_report(self):
@@ -493,14 +736,23 @@ class QCMApp(QWidget):
 
     def on_auto_refresh_toggled(self, checked):
         if checked:
+            self.last_plot_refresh_time = 0.0
+            self.plot_timer.stop()
             self.auto_refresh_timer.start()
-            self.btn_auto_refresh.setText("Auto Refresh: ON (1s)")
+            self.btn_auto_refresh.setText("Live Refresh: ON (1s)")
             self.btn_auto_refresh.setStyleSheet("background: #1565C0; color: white; padding: 6px; font-weight: bold;")
-            self.refresh_plots()
+            self.on_auto_refresh_tick(force=True)
         else:
             self.auto_refresh_timer.stop()
-            self.btn_auto_refresh.setText("Auto Refresh: OFF (1s)")
+            if self.worker:
+                self.plot_timer.start()
+            self.btn_auto_refresh.setText("Live Refresh: OFF (1s)")
             self.btn_auto_refresh.setStyleSheet("")
+
+    def on_auto_refresh_tick(self, force=False):
+        if force or self.plot_dirty:
+            self.refresh_plots()
+            self.last_plot_refresh_time = time.monotonic()
 
     def get_crosshair_data(self, prefix):
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
@@ -516,27 +768,241 @@ class QCMApp(QWidget):
         return x_data, y_data, display_prefix
 
     @staticmethod
-    def nearest_point(x_data, y_data, x):
+    def value_at_x(x_data, y_data, x):
         if not x_data or not y_data:
             return x, None
+
         max_index = min(len(x_data), len(y_data)) - 1
         idx = bisect_left(x_data, x)
         if idx <= 0:
-            nearest_idx = 0
-        elif idx > max_index:
-            nearest_idx = max_index
-        else:
-            prev_idx = idx - 1
-            nearest_idx = idx if abs(x_data[idx] - x) < abs(x_data[prev_idx] - x) else prev_idx
-        return x_data[nearest_idx], y_data[nearest_idx]
+            return x_data[0], y_data[0]
+        if idx > max_index:
+            return x_data[max_index], y_data[max_index]
+
+        x0 = x_data[idx - 1]
+        x1 = x_data[idx]
+        y0 = y_data[idx - 1]
+        y1 = y_data[idx]
+        if x1 == x0:
+            return x1, y1
+
+        ratio = (x - x0) / (x1 - x0)
+        return x, y0 + ratio * (y1 - y0)
 
     @staticmethod
     def format_crosshair_value(value, suffix):
         if value is None:
             return "--"
+        if not math.isfinite(value):
+            return str(value)
         if suffix == "Hz":
-            return f"{value:.6f}"
-        return f"{value:.6g}"
+            return f"{value:.9f}"
+        if suffix == "nm":
+            return f"{value:.9f}"
+        if suffix == "Å/s":
+            return f"{value:.9f}"
+        return f"{value:.9g}"
+
+    @staticmethod
+    def is_plot_log_y(plot):
+        try:
+            return bool(plot.plotItem.ctrl.logYCheck.isChecked())
+        except AttributeError:
+            return False
+
+    @staticmethod
+    def data_y_to_view_y(value, is_log_y):
+        if not is_log_y:
+            return value
+        if value is None or value <= 0:
+            return None
+        return math.log10(value)
+
+    @staticmethod
+    def view_y_to_data_y(value, is_log_y):
+        if not is_log_y:
+            return value
+        return 10 ** value
+
+    @staticmethod
+    def format_duration(seconds):
+        if seconds is None or seconds <= 0:
+            return "0.000 s"
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours >= 1:
+            return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
+        if minutes >= 1:
+            return f"{int(minutes):02d}:{secs:06.3f}"
+        return f"{secs:.3f} s"
+
+    def calculate_deposition_stats(self):
+        if not self.time_data or not self.thick_data:
+            return None
+
+        elapsed_s = max(float(self.time_data[-1]), 0.0)
+        thickness_nm = float(self.thick_data[-1])
+        material = MATERIALS_DB.get(self.material_name, MATERIALS_DB["Default"])
+        density_g_cm3 = float(material["density"])
+        ref_area_cm2 = float(self.spin_ref_area.value())
+
+        # thickness [nm] -> cm, density [g/cm^3] -> areal mass [ng/cm^2]
+        mass_density_ng_cm2 = density_g_cm3 * thickness_nm * 100.0
+        total_mass_ng = mass_density_ng_cm2 * ref_area_cm2
+
+        if elapsed_s > 0:
+            avg_rate_a_s = thickness_nm * 10.0 / elapsed_s
+            avg_rate_ng_s = total_mass_ng / elapsed_s
+        else:
+            avg_rate_a_s = 0.0
+            avg_rate_ng_s = 0.0
+
+        return {
+            "elapsed_s": elapsed_s,
+            "mass_density_ng_cm2": mass_density_ng_cm2,
+            "total_mass_ng": total_mass_ng,
+            "avg_rate_a_s": avg_rate_a_s,
+            "avg_rate_ng_s": avg_rate_ng_s,
+        }
+
+    def update_deposition_stats(self, *_):
+        stats = self.calculate_deposition_stats()
+        if stats is None:
+            for lbl in [self.lbl_stat_time, self.lbl_stat_mass_density, self.lbl_stat_total_mass,
+                        self.lbl_stat_avg_rate_a, self.lbl_stat_avg_rate_ng,
+                        self.lbl_rate_region_mean, self.lbl_rate_region_std, self.lbl_epd_decay]:
+                lbl.setText("--")
+            return
+
+        self.lbl_stat_time.setText(self.format_duration(stats["elapsed_s"]))
+        self.lbl_stat_mass_density.setText(f"{stats['mass_density_ng_cm2']:.6g} ng/cm²")
+        self.lbl_stat_total_mass.setText(f"{stats['total_mass_ng']:.6g} ng")
+        self.lbl_stat_avg_rate_a.setText(f"{stats['avg_rate_a_s']:.6g} Å/s")
+        self.lbl_stat_avg_rate_ng.setText(f"{stats['avg_rate_ng_s']:.6g} ng/s")
+        self.update_rate_region_stats()
+
+    def ensure_rate_region_visible(self, x_data):
+        if not hasattr(self, 'rate_region') or not x_data or self.rate_region_initialized:
+            return
+        x0 = x_data[0]
+        x1 = x_data[min(len(x_data) - 1, max(1, min(100, len(x_data) - 1)))]
+        if x1 <= x0:
+            x1 = x0 + 1.0
+        self.rate_region.setRegion([x0, x1])
+        self.rate_region_initialized = True
+
+    def update_epd_view_geometry(self):
+        if hasattr(self, 'epd_view'):
+            self.epd_view.setGeometry(self.plot_r.plotItem.vb.sceneBoundingRect())
+            self.epd_view.linkedViewChanged(self.plot_r.plotItem.vb, self.epd_view.XAxis)
+
+    @staticmethod
+    def parse_epd_time(value):
+        text = str(value).strip()
+        try:
+            numeric = float(text)
+            return numeric, numeric > 1_000_000_000
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).timestamp(), True
+            except ValueError:
+                continue
+        parsed = pd.to_datetime(text, errors='raise')
+        return parsed.timestamp(), True
+
+    def load_epd_csv(self, path):
+        times = []
+        currents = []
+        time_is_absolute = False
+        try:
+            with open(path, 'r', encoding='utf-8-sig', errors='ignore', newline='') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    try:
+                        t, is_abs = self.parse_epd_time(row[0])
+                        current = float(str(row[1]).strip())
+                    except Exception:
+                        continue
+                    times.append(t)
+                    currents.append(current)
+                    time_is_absolute = time_is_absolute or is_abs
+            if not times:
+                raise ValueError("No valid rows found. Expected CSV columns: time,current_nA")
+            combined = sorted(zip(times, currents), key=lambda item: item[0])
+            self.epd_time_data = [item[0] for item in combined]
+            self.epd_current_data = [item[1] for item in combined]
+            self.epd_time_is_absolute = time_is_absolute
+            self.refresh_plots()
+            self.lbl_status.setText(f"EPD Loaded: {len(self.epd_time_data)} pts")
+        except Exception as e:
+            QMessageBox.warning(self, "EPD Error", f"无法读取 EPD CSV 文件: {e}")
+
+    def get_epd_plot_data(self):
+        if not self.epd_time_data:
+            return [], []
+        if self.chk_abs_time.isChecked():
+            if self.epd_time_is_absolute:
+                return self.epd_time_data, self.epd_current_data
+            if self.start_ts is not None:
+                return [self.start_ts + t for t in self.epd_time_data], self.epd_current_data
+            return self.epd_time_data, self.epd_current_data
+        if self.epd_time_is_absolute:
+            base = self.start_ts if self.start_ts is not None else self.epd_time_data[0]
+            return [t - base for t in self.epd_time_data], self.epd_current_data
+        return self.epd_time_data, self.epd_current_data
+
+    def update_epd_plot(self):
+        if not hasattr(self, 'curve_epd'):
+            return
+        x_epd, y_epd = self.get_epd_plot_data()
+        self.curve_epd.setData(x_epd, y_epd)
+        self.update_epd_view_geometry()
+
+    def update_rate_region_stats(self):
+        if not hasattr(self, 'rate_region') or not self.time_data or not self.rate_data:
+            if hasattr(self, 'lbl_rate_region_mean'):
+                self.lbl_rate_region_mean.setText("--")
+                self.lbl_rate_region_std.setText("--")
+                self.lbl_epd_decay.setText("--")
+            return
+        start, end = self.rate_region.getRegion()
+        if start > end:
+            start, end = end, start
+        x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        rates = [r for x, r in zip(x_data, self.rate_data) if start <= x <= end and math.isfinite(r)]
+        if not rates:
+            self.lbl_rate_region_mean.setText("--")
+            self.lbl_rate_region_std.setText("--")
+            self.update_epd_decay_stats(start, end)
+            return
+        mean = sum(rates) / len(rates)
+        if len(rates) > 1:
+            variance = sum((r - mean) ** 2 for r in rates) / (len(rates) - 1)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        self.lbl_rate_region_mean.setText(f"{mean:.6g} Å/s (n={len(rates)})")
+        self.lbl_rate_region_std.setText(f"{std:.6g} Å/s")
+        self.update_epd_decay_stats(start, end)
+
+    def update_epd_decay_stats(self, start, end):
+        x_epd, y_epd = self.get_epd_plot_data()
+        selected = [(x, y) for x, y in zip(x_epd, y_epd) if start <= x <= end and math.isfinite(y)]
+        if len(selected) < 2:
+            self.lbl_epd_decay.setText("--")
+            return
+        first_x, first_y = selected[0]
+        last_x, last_y = selected[-1]
+        hours = (last_x - first_x) / 3600.0
+        if hours <= 0 or first_y == 0:
+            self.lbl_epd_decay.setText("--")
+            return
+        decay_pct_h = (first_y - last_y) / abs(first_y) / hours * 100.0
+        self.lbl_epd_decay.setText(f"{decay_pct_h:.6g} %/h (n={len(selected)})")
 
     def on_material_changed(self, name):
         self.material_name = name
@@ -555,6 +1021,7 @@ class QCMApp(QWidget):
 
     def on_time_axis_changed(self, checked):
         for ax in self.axes_list: ax.is_absolute = checked
+        self.rate_region_initialized = False
         self.refresh_plots()
 
     def on_raw_freq_changed(self, checked):
@@ -596,28 +1063,140 @@ class QCMApp(QWidget):
                 mouse_point = plot.plotItem.vb.mapSceneToView(pos)
                 mouse_x = mouse_point.x()
                 x_data, y_data, display_prefix = self.get_crosshair_data(prefix)
-                x, y = self.nearest_point(x_data, y_data, mouse_x)
-                if y is None:
-                    y = mouse_point.y()
+                is_log_y = self.is_plot_log_y(plot)
+                x, data_y = self.value_at_x(x_data, y_data, mouse_x)
+                if data_y is None:
+                    data_y = self.view_y_to_data_y(mouse_point.y(), is_log_y)
+                view_y = self.data_y_to_view_y(data_y, is_log_y)
+                if view_y is None:
+                    view_y = mouse_point.y()
 
                 v_line.setPos(x)
-                h_line.setPos(y)
+                h_line.setPos(view_y)
                 if self.chk_abs_time.isChecked():
                     try:
                         t_str = datetime.fromtimestamp(x).strftime("%H:%M:%S.%f")[:-3]
                     except:
                         t_str = "Inv"
                 else:
-                    t_str = f"{x:.3f}s"
-                value_str = self.format_crosshair_value(y, suffix)
+                    t_str = f"{x:.6f}s"
+                value_str = self.format_crosshair_value(data_y, suffix)
                 label.setText(f"Time: {t_str}\n{display_prefix}: {value_str} {suffix}")
-                label.setPos(x, y)
+                label.setPos(x, view_y)
                 v_line.show()
                 h_line.show()
                 label.show()
 
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
+
+    def on_grafana_dashboard_changed(self, name):
+        url = self.grafana_dashboard_urls.get(name)
+        if url:
+            self.input_grafana_dashboard.setText(url)
+
+    def open_grafana_dashboard(self):
+        url = self.input_grafana_dashboard.text().strip()
+        if url:
+            webbrowser.open(url)
+
+    def init_grafana_uploader(self):
+        self.close_grafana_uploader()
+        if not self.chk_grafana_upload.isChecked():
+            return
+        self.grafana_uploader = GrafanaInfluxUploader(
+            self.input_influx_url.text(),
+            self.input_influx_org.text(),
+            self.input_influx_bucket.text(),
+            self.input_influx_token.text(),
+        )
+
+    def close_grafana_uploader(self):
+        if self.grafana_uploader:
+            self.grafana_uploader.stop()
+            self.grafana_uploader = None
+
+    def upload_grafana_row(self, now_ts, raw_f, delta_f, thick, rate):
+        if not self.grafana_uploader:
+            return
+        fields = {
+            "frequency_raw_hz": raw_f,
+            "frequency_shift_hz": delta_f,
+            "thickness_nm": thick,
+            "rate_a_s": rate,
+        }
+        tags = {
+            "material": self.material_name,
+            "platform": self.combo_platform.currentText(),
+            "qcm_source": getattr(self, "current_qcm_source_format", "live"),
+            "qcm_channel": f"CH{getattr(self, 'current_qcm_channel', 1)}",
+        }
+        self.grafana_uploader.enqueue(fields, tags, now_ts)
+
+    def init_csv_log(self, custom_csv_path=""):
+        self.close_csv_log()
+        if custom_csv_path and custom_csv_path.strip():
+            filename = custom_csv_path
+        else:
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"QCM_Log_{ts_str}.csv"
+        dirname = os.path.dirname(os.path.abspath(filename))
+        if dirname and not os.path.exists(dirname):
+            os.makedirs(dirname)
+        self.csv_file = open(filename, mode='w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow([
+            "Timestamp_Unix", "Local_Time", "Elapsed_s", "Source_Format", "QCM_Channel",
+            "Phase", "Frequency_Raw_Hz", "Frequency_Shift_Hz", "Thickness_nm", "Rate_A_s",
+            "Material", "Tooling_percent", "Ref_Area_cm2", "Mass_Density_QCM_ng_cm2",
+            "Total_Mass_Ref_ng", "Average_Rate_A_s", "Average_Rate_ng_s",
+            *[f"IC6_CH{i}_Frequency_Hz" for i in range(1, 9)],
+            *[f"IC6_CH{i}_Active" for i in range(1, 9)],
+            *[f"SQC_Sens{i}_Rate" for i in range(1, 9)],
+            *[f"SQC_Sens{i}_Thk" for i in range(1, 9)],
+            *[f"SQC_Sens{i}_Freq" for i in range(1, 9)],
+        ])
+        self.on_log_path_received(os.path.abspath(filename))
+
+    def close_csv_log(self):
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+    def write_csv_row(self, now_ts, t_rel, raw_f, delta_f, thick, rate, metadata=None):
+        if not self.csv_writer:
+            return
+        metadata = metadata or {}
+        stats = self.calculate_deposition_stats()
+        dt_str = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S.%f")
+        def pad(values, length=8):
+            padded = list(values or [])[:length]
+            padded.extend([""] * (length - len(padded)))
+            return padded
+        def fmt(value):
+            return f"{value:.9f}" if isinstance(value, (int, float)) and math.isfinite(value) else ""
+        ic6_freqs = pad(metadata.get("frequencies"))
+        ic6_active = pad(metadata.get("active_values"))
+        sqc_rates = pad(metadata.get("sensor_rates"))
+        sqc_thicks = pad(metadata.get("sensor_thicknesses"))
+        sqc_freqs = pad(metadata.get("sensor_frequencies"))
+        row = [
+            f"{now_ts:.6f}", dt_str, f"{t_rel:.6f}", metadata.get("source_format", "live"),
+            metadata.get("channel", ""), metadata.get("phase", ""), f"{raw_f:.9f}",
+            f"{delta_f:.9f}", f"{thick:.9f}", f"{rate:.9f}", self.material_name,
+            f"{self.spin_tooling.value():.6f}", f"{self.spin_ref_area.value():.6f}",
+            f"{stats['mass_density_ng_cm2']:.9f}" if stats else "",
+            f"{stats['total_mass_ng']:.9f}" if stats else "",
+            f"{stats['avg_rate_a_s']:.9f}" if stats else "",
+            f"{stats['avg_rate_ng_s']:.9f}" if stats else "",
+            *[fmt(v) for v in ic6_freqs],
+            *[fmt(v) for v in ic6_active],
+            *[fmt(v) for v in sqc_rates],
+            *[fmt(v) for v in sqc_thicks],
+            *[fmt(v) for v in sqc_freqs],
+        ]
+        self.csv_writer.writerow(row)
 
     def start_experiment(self):
         src_id = self.group_source.checkedId()
@@ -631,7 +1210,11 @@ class QCMApp(QWidget):
             elif src_id == 2:
                 path = self.input_file_path.text();
                 if not path: return
-                self.ds = IC6TxtReplay(path)
+                replay_channel = self.combo_replay_channel.currentIndex() + 1
+                replay_format = self.combo_replay_format.currentText()
+                sqc_sensor = 1 if replay_format == "SQC-310" and replay_channel == 6 else replay_channel
+                self.ds = AutoQCMFileReplay(path, ic6_channel=replay_channel,
+                                            sqc_sensor=sqc_sensor, file_format=replay_format)
             elif src_id == 3:
                 ip = self.input_ip.text();
                 port = int(self.input_port.text())
@@ -656,18 +1239,34 @@ class QCMApp(QWidget):
             self.f0 = None;
             self.start_ts = None;
             self.last_smooth_rate = 0.0
+            self.plot_dirty = False
+            self.last_plot_refresh_time = 0.0
+            self.rate_region_initialized = False
+            self.current_qcm_source_format = "live"
+            self.current_qcm_channel = 1
+            self.update_deposition_stats()
 
             speed = self.spin_speed.value();
             save_csv = self.chk_record.isChecked();
             custom_path = self.input_csv_path.text()
-            self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=save_csv,
-                                    custom_csv_path=custom_path)
+            if save_csv:
+                self.init_csv_log(custom_path)
+            else:
+                self.close_csv_log()
+            self.init_grafana_uploader()
+            self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=False,
+                                    custom_csv_path="")
             self.worker.chunk_signal.connect(self.process_chunk);
             self.worker.finished_signal.connect(self.on_replay_finished)
             self.worker.error_signal.connect(self.on_worker_error);
             self.worker.log_path_signal.connect(self.on_log_path_received)
             self.worker.start();
-            self.plot_timer.start()
+            if self.btn_auto_refresh.isChecked():
+                self.auto_refresh_timer.start()
+            else:
+                self.plot_timer.start()
+            if src_id == 2 and not self.btn_auto_refresh.isChecked():
+                self.btn_auto_refresh.setChecked(True)
             self.btn_start.setEnabled(False);
             self.btn_stop.setEnabled(True);
             self.lbl_status.setText("RUNNING");
@@ -677,8 +1276,11 @@ class QCMApp(QWidget):
 
     def stop_experiment(self):
         self.plot_timer.stop()
+        self.auto_refresh_timer.stop()
         if self.worker: self.worker.stop(); self.worker = None
         if self.ds: self.ds.disconnect()
+        self.close_csv_log()
+        self.close_grafana_uploader()
         self.input_csv_path.setEnabled(True);
         self.btn_csv_browse.setEnabled(True)
         self.btn_start.setEnabled(True);
@@ -700,7 +1302,9 @@ class QCMApp(QWidget):
 
     def refresh_plots(self):
         if not self.time_data: return
+        self.plot_dirty = False
         x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        self.ensure_rate_region_visible(x_data)
         if self.chk_raw_freq.isChecked():
             self.curve_f.setData(x_data, list(self.raw_freq_data))
             if self.raw_freq_data: self.plot_f.enableAutoRange(axis='y')
@@ -709,11 +1313,25 @@ class QCMApp(QWidget):
             if self.freq_data: self.plot_f.enableAutoRange(axis='y')
         self.curve_t.setData(x_data, list(self.thick_data))
         self.curve_r.setData(x_data, list(self.rate_data))
+        self.update_epd_plot()
+        self.update_deposition_stats()
 
     def process_chunk(self, data_list):
         for data in data_list:
             now_ts = data["timestamp"];
             raw_f = data["frequency"]
+            metadata = {
+                "source_format": data.get("source_format", "live"),
+                "channel": data.get("channel", 1),
+                "phase": data.get("phase", ""),
+                "frequencies": data.get("frequencies"),
+                "active_values": data.get("active_values"),
+                "sensor_rates": data.get("sensor_rates"),
+                "sensor_thicknesses": data.get("sensor_thicknesses"),
+                "sensor_frequencies": data.get("sensor_frequencies"),
+            }
+            self.current_qcm_source_format = metadata["source_format"]
+            self.current_qcm_channel = metadata["channel"]
             if self.start_ts is None: self.start_ts = now_ts; self.f0 = raw_f
             t_rel = now_ts - self.start_ts
             delta_f = raw_f - self.f0
@@ -724,8 +1342,8 @@ class QCMApp(QWidget):
             self.raw_freq_data.append(raw_f)
             self.thick_data.append(thick)
 
-            # 使用 V3.6 的平滑逻辑
-            raw_rate = qcm_calc.calc_rate(list(self.time_data), list(self.thick_data), window=60)
+            # 使用 V3.6 的平滑逻辑，只取最近窗口，避免大文件回放时每个点复制全量数据。
+            raw_rate = qcm_calc.calc_rate(list(self.time_data)[-60:], list(self.thick_data)[-60:], window=60)
             alpha = 0.2
             if len(self.rate_data) == 0:
                 smooth_rate = raw_rate
@@ -733,6 +1351,21 @@ class QCMApp(QWidget):
                 smooth_rate = alpha * raw_rate + (1 - alpha) * self.last_smooth_rate
             self.last_smooth_rate = smooth_rate
             self.rate_data.append(smooth_rate)
+            self.write_csv_row(now_ts, t_rel, raw_f, delta_f, thick, smooth_rate, metadata)
+            self.upload_grafana_row(now_ts, raw_f, delta_f, thick, smooth_rate)
+
+        if self.csv_file:
+            self.csv_file.flush()
+
+        self.plot_dirty = True
+        if self.btn_auto_refresh.isChecked():
+            current_time = time.monotonic()
+            if current_time - self.last_plot_refresh_time >= 1.0:
+                self.refresh_plots()
+                self.last_plot_refresh_time = current_time
+                QApplication.processEvents()
+        else:
+            self.refresh_plots()
 
         if len(self.freq_data) > 60:
             if qcm_calc.is_steady_state(list(self.freq_data)[-60:], list(self.time_data)[-60:], 1.0):
