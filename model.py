@@ -102,25 +102,24 @@ class QCMCalculator:
         except:
             return False
 
-
-# --- 使用示例 ---
-
-# 1. 实例化 (应用你刚才计算出的 150.2% 校准值)
-# 实际值 311 / 监测值 207 = 1.502
+# --- 默认计算器实例 ---
+# 实际值 311 / 监测值 207 = 1.502，因此默认 Tooling Factor 为 150.2%。
 qcm_calc = QCMCalculator(tooling_factor=1.502)
 
-# 2. 模拟测试 InSn 合金
-# 假设频率变化了 -1000 Hz
-delta_freq = -1000
-thickness = qcm_calc.freq_to_thickness(delta_freq, "InSn")
 
-print(f"当前 Tooling Factor: {qcm_calc.tooling_factor * 100:.1f}%")
-print(f"InSn 频率下降 1000Hz 对应的厚度: {thickness:.2f} nm")
+def _demo():
+    demo_calc = QCMCalculator(tooling_factor=1.502)
+    delta_freq = -1000
+    thickness = demo_calc.freq_to_thickness(delta_freq, "InSn")
+    print(f"当前 Tooling Factor: {demo_calc.tooling_factor * 100:.1f}%")
+    print(f"InSn 频率下降 1000Hz 对应的厚度: {thickness:.2f} nm")
 
-# 3. 模拟测试 Carbon (碳)
-# 如果换成镀碳，通常需要重新校准 tooling，这里假设先重置为 100%
-qcm_calc.set_tooling(100.0)
-c_thickness = qcm_calc.freq_to_thickness(-1000, "C")
-print(f"---")
-print(f"切换为 Carbon (Tooling 100%)")
-print(f"Carbon 频率下降 1000Hz 对应的厚度: {c_thickness:.2f} nm")
+    demo_calc.set_tooling(100.0)
+    c_thickness = demo_calc.freq_to_thickness(-1000, "C")
+    print("---")
+    print("切换为 Carbon (Tooling 100%)")
+    print(f"Carbon 频率下降 1000Hz 对应的厚度: {c_thickness:.2f} nm")
+
+
+if __name__ == "__main__":
+    _demo()
