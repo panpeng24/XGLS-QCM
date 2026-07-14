@@ -170,3 +170,7 @@ The GUI limits plotted points to the newest 20,000 samples per curve while keepi
 ### IC6 channel visibility
 
 In File Replay, IC6 `CH1`-`CH8` checkboxes now directly control whether each channel curve is displayed. All eight IC6 channels are calculated from the replay rows, and each visible channel uses a distinct pyqtgraph color on the synchronized frequency, thickness, and rate plots. Unchecking a channel hides its curves without stopping replay.
+
+### v4.5.1 replay and EPD UI fixes
+
+EPD CSV loading now refreshes the EPD curve even before QCM data is present and auto-ranges the EPD right-axis view. File replay can auto-start after selecting a log file when **Auto-start replay after file select** is enabled. Large replay plots are reduced by even sampling across the full document range, so the visible plot represents the whole file instead of only the latest tail. Data Connection controls are opened from **Data Connection...** in a secondary dialog to keep the main panel compact.

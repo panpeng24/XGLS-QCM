@@ -303,6 +303,7 @@ class QCMApp(QWidget):
 
         # --- A. 数据源 ---
         gb_source = QGroupBox("1. Data Connection")
+        self.gb_source = gb_source
         vb_source = QVBoxLayout()
         self.group_source = QButtonGroup()
         self.rb_mock = QRadioButton("Mock Simulation")
@@ -350,7 +351,11 @@ class QCMApp(QWidget):
             layout_ic6_channels.addWidget(chk, 0 if i <= 4 else 1, (i - 1) % 4)
         f_file_options.addRow("Replay Format:", self.combo_replay_format)
         f_file_options.addRow("Primary Channel/Sensor:", self.combo_replay_channel)
+        self.chk_file_auto_start = QCheckBox("Auto-start replay after file select")
+        self.chk_file_auto_start.setChecked(True)
+        self.chk_file_auto_start.setToolTip("When File Replay is selected, choosing a log file starts replay automatically.")
         f_file_options.addRow("IC6 Plot Channels:", self.widget_ic6_channels)
+        f_file_options.addRow(self.chk_file_auto_start)
 
         self.widget_net = QWidget()
         f_net = QFormLayout(self.widget_net);
@@ -604,7 +609,9 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.lbl_status)
         gb_ctrl.setLayout(vb_ctrl)
 
-        ctrl_panel.addWidget(gb_source);
+        self.btn_data_connection = QPushButton("Data Connection...")
+        self.btn_data_connection.clicked.connect(self.open_data_connection_settings)
+        ctrl_panel.addWidget(self.btn_data_connection)
         ctrl_panel.addWidget(gb_param)
         ctrl_panel.addWidget(gb_report);
         ctrl_panel.addWidget(gb_stats);
@@ -672,6 +679,16 @@ class QCMApp(QWidget):
         self.widget_net.setVisible(sid == 3)
 
 
+    def open_data_connection_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Data Connection")
+        layout = QVBoxLayout(dialog)
+        self.gb_source.setParent(dialog)
+        layout.addWidget(self.gb_source)
+        dialog.finished.connect(lambda _result: (self.gb_source.setParent(None), self.gb_source.hide()))
+        dialog.resize(520, 320)
+        dialog.exec_()
+
     def on_replay_format_changed(self, fmt):
         is_sqc = fmt == "SQC-310"
         if is_sqc and self.combo_replay_channel.currentText() == "CH6":
@@ -711,7 +728,10 @@ class QCMApp(QWidget):
 
     def select_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Log", "", "QCM Logs (*.txt *.csv);;Txt (*.txt);;CSV (*.csv);;All (*)")
-        if fname: self.input_file_path.setText(fname)
+        if fname:
+            self.input_file_path.setText(fname)
+            if self.group_source.checkedId() == 2 and self.chk_file_auto_start.isChecked() and not self.worker:
+                QTimer.singleShot(0, self.start_experiment)
 
     def select_save_csv(self):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Data As", f"QCM_{datetime.now().strftime('%Y%m%d')}.csv",
@@ -1012,6 +1032,16 @@ class QCMApp(QWidget):
             return
         x_epd, y_epd = self.get_epd_plot_data()
         self.curve_epd.setData(x_epd, y_epd)
+        if x_epd and not self.time_data:
+            self.plot_r.setXRange(min(x_epd), max(x_epd), padding=0.02)
+        if y_epd:
+            y_min = min(y_epd)
+            y_max = max(y_epd)
+            if y_min == y_max:
+                padding = max(abs(y_min) * 0.05, 1.0)
+                y_min -= padding
+                y_max += padding
+            self.epd_view.setYRange(y_min, y_max, padding=0.05)
         self.update_epd_view_geometry()
 
     def update_rate_region_stats(self):
@@ -1369,13 +1399,19 @@ class QCMApp(QWidget):
         self.stop_experiment(); QMessageBox.warning(self, "Error", msg)
 
     @staticmethod
-    def plot_tail_xy(x_values, y_values, max_points=20000):
+    def plot_display_xy(x_values, y_values, max_points=20000):
         x_list = list(x_values)
         y_list = list(y_values)
-        if len(x_list) > max_points:
-            x_list = x_list[-max_points:]
-            y_list = y_list[-max_points:]
-        return x_list, y_list
+        n_points = min(len(x_list), len(y_list))
+        if n_points <= max_points:
+            return x_list[:n_points], y_list[:n_points]
+        step = max(1, math.ceil(n_points / max_points))
+        x_reduced = x_list[:n_points:step]
+        y_reduced = y_list[:n_points:step]
+        if x_reduced[-1] != x_list[n_points - 1]:
+            x_reduced.append(x_list[n_points - 1])
+            y_reduced.append(y_list[n_points - 1])
+        return x_reduced, y_reduced
 
     def clear_channel_curves(self):
         for curves in self.channel_curves.values():
@@ -1412,18 +1448,20 @@ class QCMApp(QWidget):
             curves = self.ensure_channel_curves(channel)
             x_source = store["abs_time"] if x_is_absolute else store["time"]
             if self.chk_raw_freq.isChecked():
-                x_data, y_data = self.plot_tail_xy(x_source, store["raw"])
+                x_data, y_data = self.plot_display_xy(x_source, store["raw"])
                 curves["freq"].setData(x_data, y_data)
             else:
-                x_data, y_data = self.plot_tail_xy(x_source, store["shift"])
+                x_data, y_data = self.plot_display_xy(x_source, store["shift"])
                 curves["freq"].setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, store["thick"])
+            x_data, y_data = self.plot_display_xy(x_source, store["thick"])
             curves["thick"].setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, store["rate"])
+            x_data, y_data = self.plot_display_xy(x_source, store["rate"])
             curves["rate"].setData(x_data, y_data)
 
     def refresh_plots(self):
-        if not self.time_data: return
+        if not self.time_data:
+            self.update_epd_plot()
+            return
         self.plot_dirty = False
         x_source = self.abs_time_data if self.chk_abs_time.isChecked() else self.time_data
         x_all = list(x_source)
@@ -1434,18 +1472,18 @@ class QCMApp(QWidget):
             self.curve_t.setData([], [])
             self.curve_r.setData([], [])
         elif self.chk_raw_freq.isChecked():
-            x_data, y_data = self.plot_tail_xy(x_source, self.raw_freq_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.raw_freq_data)
             self.curve_f.setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.thick_data)
             self.curve_t.setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.rate_data)
             self.curve_r.setData(x_data, y_data)
         else:
-            x_data, y_data = self.plot_tail_xy(x_source, self.freq_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.freq_data)
             self.curve_f.setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, self.thick_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.thick_data)
             self.curve_t.setData(x_data, y_data)
-            x_data, y_data = self.plot_tail_xy(x_source, self.rate_data)
+            x_data, y_data = self.plot_display_xy(x_source, self.rate_data)
             self.curve_r.setData(x_data, y_data)
         self.update_ic6_channel_plots(self.chk_abs_time.isChecked())
         self.update_epd_plot()
