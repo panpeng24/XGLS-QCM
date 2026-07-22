@@ -174,3 +174,16 @@ In File Replay, IC6 `CH1`-`CH8` checkboxes now directly control whether each cha
 ### v4.5.1 replay and EPD UI fixes
 
 EPD CSV loading now refreshes the EPD curve even before QCM data is present and auto-ranges the EPD right-axis view. File replay can auto-start after selecting a log file when **Auto-start replay after file select** is enabled. Large replay plots are reduced by even sampling across the full document range, so the visible plot represents the whole file instead of only the latest tail. Data Connection controls are opened from **Data Connection...** in a secondary dialog to keep the main panel compact.
+
+## LRP InfluxDB / Grafana upload
+
+The Grafana upload panel supports the LRP InfluxDB 1.x write endpoint. Use **Grafana Settings...** and keep **Influx API** set to `InfluxDB 1.x (LRP)`. The default fields are prefilled for the LRP server:
+
+```text
+Influx URL: http://10.29.112.200:8087
+User: dg130
+Database: dg130
+Password: huawei
+```
+
+When **Upload to Grafana (InfluxDB)** is enabled and acquisition/replay starts, each calculated QCM row is written to `/write?db=dg130&u=dg130&p=huawei` as line protocol measurement `qcm`. Fields include `frequency_raw_hz`, `frequency_shift_hz`, `thickness_nm`, and `rate_a_s`; tags include `material`, `platform`, `qcm_source`, and `qcm_channel`. Grafana should query the same `dg130` database and `qcm` measurement.

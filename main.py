@@ -45,12 +45,13 @@ pg.setConfigOption('antialias', True)
 # Grafana / InfluxDB 上传器
 # ==========================================
 class GrafanaInfluxUploader:
-    def __init__(self, base_url, org, bucket, token, measurement="qcm"):
+    def __init__(self, base_url, org, bucket, token, measurement="qcm", api_version="v1"):
         self.base_url = base_url.rstrip("/")
         self.org = org.strip()
         self.bucket = bucket.strip()
         self.token = token.strip()
         self.measurement = measurement.strip() or "qcm"
+        self.api_version = api_version
         self.queue = queue.Queue(maxsize=10000)
         self.running = True
         self.last_error = ""
@@ -91,11 +92,17 @@ class GrafanaInfluxUploader:
                 pass
 
     def _write_batch(self, lines):
-        params = urllib.parse.urlencode({"org": self.org, "bucket": self.bucket, "precision": "ns"})
-        url = f"{self.base_url}/api/v2/write?{params}"
         headers = {"Content-Type": "text/plain; charset=utf-8"}
-        if self.token:
-            headers["Authorization"] = f"Token {self.token}"
+        if self.api_version == "v2":
+            params = urllib.parse.urlencode({"org": self.org, "bucket": self.bucket, "precision": "ns"})
+            url = f"{self.base_url}/api/v2/write?{params}"
+            if self.token:
+                headers["Authorization"] = f"Token {self.token}"
+        else:
+            # LRP uses InfluxDB 1.x style endpoint:
+            # http://host:8087/write?db=dg130&u=dg130&p=huawei
+            params = urllib.parse.urlencode({"db": self.bucket, "u": self.org, "p": self.token})
+            url = f"{self.base_url}/write?{params}"
         req = urllib.request.Request(url, data=("\n".join(lines)).encode("utf-8"), headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=3) as resp:
             resp.read()
@@ -556,16 +563,19 @@ class QCMApp(QWidget):
         self.btn_auto_refresh.toggled.connect(self.on_auto_refresh_toggled)
 
         self.chk_grafana_upload = QCheckBox("Upload to Grafana (InfluxDB)")
-        self.chk_grafana_upload.setToolTip("实时写入 InfluxDB v2；Grafana 添加该 InfluxDB 数据源后即可做看板。")
+        self.chk_grafana_upload.setToolTip("实时写入 LRP InfluxDB 1.x 或 InfluxDB 2.x；Grafana 添加该 InfluxDB 数据源后即可做看板。")
         self.widget_grafana = QWidget()
         f_grafana = QFormLayout(self.widget_grafana)
         f_grafana.setContentsMargins(0, 0, 0, 0)
-        self.input_influx_url = QLineEdit("http://localhost:8086")
-        self.input_influx_org = QLineEdit("qcm")
-        self.input_influx_bucket = QLineEdit("qcm")
-        self.input_influx_token = QLineEdit()
+        self.combo_influx_api = QComboBox()
+        self.combo_influx_api.addItems(["InfluxDB 1.x (LRP)", "InfluxDB 2.x"])
+        self.combo_influx_api.currentTextChanged.connect(self.on_influx_api_changed)
+        self.input_influx_url = QLineEdit("http://10.29.112.200:8087")
+        self.input_influx_org = QLineEdit("dg130")
+        self.input_influx_bucket = QLineEdit("dg130")
+        self.input_influx_token = QLineEdit("huawei")
         self.input_influx_token.setEchoMode(QLineEdit.Password)
-        self.input_influx_token.setPlaceholderText("InfluxDB API token")
+        self.input_influx_token.setPlaceholderText("InfluxDB password or API token")
         self.grafana_dashboard_urls = {
             "LRP P2": "http://10.29.112.200:3000/grafana/d/a0164f95-1a6d-4a78-958f-bf5e437e7a57/lrp-p2?orgId=1",
             "LDP P1": "http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/ldp-p1?orgId=1&from=now-6h&to=now",
@@ -577,10 +587,14 @@ class QCMApp(QWidget):
         self.input_grafana_dashboard.setToolTip("Grafana 看板页面地址；用于快速打开看板，不是数据写入接口。")
         self.btn_open_grafana = QPushButton("Open Dashboard")
         self.btn_open_grafana.clicked.connect(self.open_grafana_dashboard)
+        self.lbl_influx_org = QLabel("User:")
+        self.lbl_influx_bucket = QLabel("Database:")
+        self.lbl_influx_token = QLabel("Password:")
+        f_grafana.addRow("Influx API:", self.combo_influx_api)
         f_grafana.addRow("Influx URL:", self.input_influx_url)
-        f_grafana.addRow("Org:", self.input_influx_org)
-        f_grafana.addRow("Bucket:", self.input_influx_bucket)
-        f_grafana.addRow("Token:", self.input_influx_token)
+        f_grafana.addRow(self.lbl_influx_org, self.input_influx_org)
+        f_grafana.addRow(self.lbl_influx_bucket, self.input_influx_bucket)
+        f_grafana.addRow(self.lbl_influx_token, self.input_influx_token)
         f_grafana.addRow("Dashboard Preset:", self.combo_grafana_dashboard)
         f_grafana.addRow("Dashboard URL:", self.input_grafana_dashboard)
         f_grafana.addRow(self.btn_open_grafana)
@@ -1172,6 +1186,16 @@ class QCMApp(QWidget):
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
 
+    def on_influx_api_changed(self, api_name):
+        is_v2 = "2.x" in api_name
+        self.lbl_influx_org.setText("Org:" if is_v2 else "User:")
+        self.lbl_influx_bucket.setText("Bucket:" if is_v2 else "Database:")
+        self.lbl_influx_token.setText("Token:" if is_v2 else "Password:")
+        if is_v2 and self.input_influx_url.text().strip() == "http://10.29.112.200:8087":
+            self.input_influx_url.setText("http://localhost:8086")
+        elif not is_v2 and self.input_influx_url.text().strip() == "http://localhost:8086":
+            self.input_influx_url.setText("http://10.29.112.200:8087")
+
     def open_grafana_settings(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Grafana / InfluxDB Settings")
@@ -1196,11 +1220,13 @@ class QCMApp(QWidget):
         self.close_grafana_uploader()
         if not self.chk_grafana_upload.isChecked():
             return
+        api_version = "v2" if "2.x" in self.combo_influx_api.currentText() else "v1"
         self.grafana_uploader = GrafanaInfluxUploader(
             self.input_influx_url.text(),
             self.input_influx_org.text(),
             self.input_influx_bucket.text(),
             self.input_influx_token.text(),
+            api_version=api_version,
         )
 
     def close_grafana_uploader(self):
