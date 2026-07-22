@@ -583,8 +583,9 @@ class QCMApp(QWidget):
         self.combo_influx_db_preset = QComboBox()
         self.influx_db_presets = {
             "Test (dg130)": "dg130",
-            "LRP P1 Sensors": "LRP-P1-Sensors",
-            "LRP P2 Sensors": "LRP-P2-Sensors",
+            "P1 (LRP-P1-Sensors)": "LRP-P1-Sensors",
+            "P2 (LRP-P2-Sensors)": "LRP-P2-Sensors",
+            "Alpha1 (LRP-Alpha1)": "LRP-Alpha1",
         }
         self.combo_influx_db_preset.addItems(self.influx_db_presets.keys())
         self.combo_influx_db_preset.currentTextChanged.connect(self.on_influx_db_preset_changed)
