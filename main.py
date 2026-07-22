@@ -91,6 +91,13 @@ class GrafanaInfluxUploader:
             except queue.Full:
                 pass
 
+    def clear(self):
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
     def _write_batch(self, lines):
         headers = {"Content-Type": "text/plain; charset=utf-8"}
         if self.api_version == "v2":
@@ -117,7 +124,7 @@ class GrafanaInfluxUploader:
                 buffer.append(line)
             except queue.Empty:
                 pass
-            if buffer and (len(buffer) >= 200 or time.monotonic() - last_flush >= 1.0 or not self.running):
+            if buffer and (len(buffer) >= 100 or time.monotonic() - last_flush >= 1.0 or not self.running):
                 try:
                     self._write_batch(buffer)
                     self.last_error = ""
@@ -573,6 +580,16 @@ class QCMApp(QWidget):
         self.input_influx_url = QLineEdit("http://10.29.112.200:8087")
         self.input_influx_org = QLineEdit("dg130")
         self.input_influx_bucket = QLineEdit("dg130")
+        self.combo_influx_db_preset = QComboBox()
+        self.influx_db_presets = {
+            "Test (dg130)": "dg130",
+            "LRP P1 Sensors": "LRP-P1-Sensors",
+            "LRP P2 Sensors": "LRP-P2-Sensors",
+        }
+        self.combo_influx_db_preset.addItems(self.influx_db_presets.keys())
+        self.combo_influx_db_preset.currentTextChanged.connect(self.on_influx_db_preset_changed)
+        self.input_influx_measurement = QLineEdit("QCM")
+        self.input_influx_measurement.setToolTip("Measurement name, e.g. LiquidTin, QCM, EPD. Avoid special characters.")
         self.input_influx_token = QLineEdit("huawei")
         self.input_influx_token.setEchoMode(QLineEdit.Password)
         self.input_influx_token.setPlaceholderText("InfluxDB password or API token")
@@ -593,7 +610,9 @@ class QCMApp(QWidget):
         f_grafana.addRow("Influx API:", self.combo_influx_api)
         f_grafana.addRow("Influx URL:", self.input_influx_url)
         f_grafana.addRow(self.lbl_influx_org, self.input_influx_org)
+        f_grafana.addRow("DB Preset:", self.combo_influx_db_preset)
         f_grafana.addRow(self.lbl_influx_bucket, self.input_influx_bucket)
+        f_grafana.addRow("Measurement:", self.input_influx_measurement)
         f_grafana.addRow(self.lbl_influx_token, self.input_influx_token)
         f_grafana.addRow("Dashboard Preset:", self.combo_grafana_dashboard)
         f_grafana.addRow("Dashboard URL:", self.input_grafana_dashboard)
@@ -1186,6 +1205,11 @@ class QCMApp(QWidget):
         proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
         setattr(plot, 'crosshair_proxy', proxy)
 
+    def on_influx_db_preset_changed(self, preset_name):
+        database = self.influx_db_presets.get(preset_name)
+        if database:
+            self.input_influx_bucket.setText(database)
+
     def on_influx_api_changed(self, api_name):
         is_v2 = "2.x" in api_name
         self.lbl_influx_org.setText("Org:" if is_v2 else "User:")
@@ -1226,8 +1250,10 @@ class QCMApp(QWidget):
             self.input_influx_org.text(),
             self.input_influx_bucket.text(),
             self.input_influx_token.text(),
+            measurement=self.input_influx_measurement.text().strip() or "QCM",
             api_version=api_version,
         )
+        self.grafana_uploader.clear()
 
     def close_grafana_uploader(self):
         if self.grafana_uploader:
@@ -1238,10 +1264,10 @@ class QCMApp(QWidget):
         if not self.grafana_uploader:
             return
         fields = {
-            "frequency_raw_hz": raw_f,
-            "frequency_shift_hz": delta_f,
-            "thickness_nm": thick,
-            "rate_a_s": rate,
+            "FrequencyRaw_Hz": float(raw_f),
+            "FrequencyShift_Hz": float(delta_f),
+            "Thickness_nm": float(thick),
+            "Rate_A_per_s": float(rate),
         }
         tags = {
             "material": self.material_name,

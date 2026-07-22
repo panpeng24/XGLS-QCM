@@ -129,12 +129,12 @@ LDP P1: http://10.29.207.25:3000/grafana/d/a0458676-b495-4a67-9b3f-b29f081cf41c/
 Note that these Grafana URLs open dashboards only; real-time data must still be
 written to the InfluxDB data source configured behind each dashboard.
 
-The app writes measurement `qcm` with tags `material` and `platform`, and fields:
+The app writes measurement `QCM` with tags `material` and `platform`, and fields:
 
-- `frequency_raw_hz`
-- `frequency_shift_hz`
-- `thickness_nm`
-- `rate_a_s`
+- `FrequencyRaw_Hz`
+- `FrequencyShift_Hz`
+- `Thickness_nm`
+- `Rate_A_per_s`
 
 Example Flux query in Grafana:
 
@@ -142,7 +142,7 @@ Example Flux query in Grafana:
 from(bucket: "qcm")
   |> range(start: -1h)
   |> filter(fn: (r) => r._measurement == "qcm")
-  |> filter(fn: (r) => r._field == "thickness_nm" or r._field == "rate_a_s")
+  |> filter(fn: (r) => r._field == "Thickness_nm" or r._field == "Rate_A_per_s")
 ```
 
 ## File replay formats: IC6 and SQC-310
@@ -186,4 +186,8 @@ Database: dg130
 Password: huawei
 ```
 
-When **Upload to Grafana (InfluxDB)** is enabled and acquisition/replay starts, each calculated QCM row is written to `/write?db=dg130&u=dg130&p=huawei` as line protocol measurement `qcm`. Fields include `frequency_raw_hz`, `frequency_shift_hz`, `thickness_nm`, and `rate_a_s`; tags include `material`, `platform`, `qcm_source`, and `qcm_channel`. Grafana should query the same `dg130` database and `qcm` measurement.
+When **Upload to Grafana (InfluxDB)** is enabled and acquisition/replay starts, each calculated QCM row is written to `/write?db=dg130&u=dg130&p=huawei` as line protocol measurement `QCM`. Fields include `FrequencyRaw_Hz`, `FrequencyShift_Hz`, `Thickness_nm`, and `Rate_A_per_s`; tags include `material`, `platform`, `qcm_source`, and `qcm_channel`. Grafana should query the same `dg130` database and `QCM` measurement.
+
+### InfluxDB line-protocol data contract
+
+LRP upload uses one line-protocol point per QCM timestamp. The measurement name is configurable (default `QCM`; examples include `LiquidTin`, `QCM`, and `EPD`). Field names include English units and avoid special unit characters: `FrequencyRaw_Hz`, `FrequencyShift_Hz`, `Thickness_nm`, and `Rate_A_per_s`. Values are converted to `float`, and timestamps are Unix nanoseconds. Use the DB preset selector before starting upload: `LRP P1 Sensors` writes to `LRP-P1-Sensors`, `LRP P2 Sensors` writes to `LRP-P2-Sensors`, and `Test (dg130)` writes to `dg130`. The uploader clears its local queue at start, buffers points in memory, and writes batches of up to 100 lines per request.
