@@ -643,9 +643,7 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.lbl_status)
         gb_ctrl.setLayout(vb_ctrl)
 
-        self.btn_data_connection = QPushButton("Data Connection...")
-        self.btn_data_connection.clicked.connect(self.open_data_connection_settings)
-        ctrl_panel.addWidget(self.btn_data_connection)
+        ctrl_panel.addWidget(gb_source)
         ctrl_panel.addWidget(gb_param)
         ctrl_panel.addWidget(gb_report);
         ctrl_panel.addWidget(gb_stats);
@@ -712,16 +710,6 @@ class QCMApp(QWidget):
         self.widget_file_options.setVisible(sid == 2)
         self.widget_net.setVisible(sid == 3)
 
-
-    def open_data_connection_settings(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Data Connection")
-        layout = QVBoxLayout(dialog)
-        self.gb_source.setParent(dialog)
-        layout.addWidget(self.gb_source)
-        dialog.finished.connect(lambda _result: (self.gb_source.setParent(None), self.gb_source.hide()))
-        dialog.resize(520, 320)
-        dialog.exec_()
 
     def on_replay_format_changed(self, fmt):
         is_sqc = fmt == "SQC-310"
