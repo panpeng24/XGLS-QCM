@@ -117,3 +117,20 @@ python faraday_cup_app.py
 - `Measurement`：默认 `faraday_cup_cycle`。
 
 上传的字段包括 `distance_m`、`peak_index`、`peak_time_s`、`peak_voltage`、`kinetic_energy_mJ`，标签包括 `ion`、`platform`、`cycle`。
+
+### Windows PyQt5 DLL 报错处理
+
+如果运行 `python faraday_cup_app.py` 时出现类似 `ImportError: DLL load failed while importing QtCore`，入口程序会自动回退到 Tkinter 标准库界面，仍可完成 CSV 分析、Excel 导出和 Grafana/InfluxDB 上传。
+
+如需使用带内嵌能谱图的 PyQt/pyqtgraph 界面，请在当前虚拟环境中重新安装 Qt 依赖：
+
+```bash
+python -m pip uninstall -y PyQt5 PyQt5-Qt5 PyQt5-sip pyqtgraph
+python -m pip install PyQt5 pyqtgraph
+```
+
+也可以直接启动兜底界面：
+
+```bash
+python faraday_cup_tk_app.py
+```
