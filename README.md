@@ -76,3 +76,61 @@ MATERIALS_DB	dict	材料密度数据库，key 为材料简称，value 包含密�
 Tooling Factor 校准：需根据实际镀膜工艺校准（实际厚度 / 监测厚度），是提升厚度计算精度的关键；
 碳膜密度：蒸发碳膜密度通常在 1.8-2.25 g/cm³ 之间，默认取石墨标准值 2.25，可根据实验需求调整；
 稳态判断阈值：需根据具体工艺场景调整（如高精度镀膜可设为 0.5 Hz/min，粗镀膜可设为 2.0 Hz/min）。
+
+## Faraday Cup / TOF 能谱分析 App
+
+仓库现在包含一个独立的法拉第杯飞行时间（TOF）能谱分析工具，用于优化并封装原始示波器脚本：
+
+```bash
+python faraday_cup_app.py
+```
+
+### 支持能力
+
+- **不同检测光源平台**：内置 `Custom`、`LaserBench-0.6m`、`Compact-0.52m`、`LongTOF-1.0m` 等平台预设；选择平台后会自动带出默认 Fcup 距离，也可以手动覆盖。
+- **不同离子种类**：内置 Xe、Sn、In、Ar、He、C、Cu 等常见离子质量与默认一价态；界面中可手动修改质量数和价态，方便扩展到其它离子或多价离子。
+- **手动设置 Fcup 距离**：界面提供 `Fcup 距离` 输入框，所有飞行时间到能量的换算都会使用该距离。
+- **可配置信号处理**：支持噪声窗口、采样间隔、每周期点数、光电峰搜索范围、波形单位、信号极性、负载电阻、能量积分范围和插值方式。
+- **Grafana 上传**：Grafana 通常读取 InfluxDB、Prometheus 等数据源。本工具支持将每周期摘要以 InfluxDB line protocol 写入 InfluxDB v2 写入接口，然后在 Grafana 中配置对应 bucket 作为 dashboard 数据源。
+
+### 处理流程
+
+1. 读取示波器导出的 CSV 第一列波形；
+2. 使用前置噪声窗口做基线扣除；
+3. 根据极性配置保留正信号、负信号、绝对值或原始信号；
+4. 按每周期点数切片；
+5. 在每个周期的光电峰窗口中寻找时间零点；
+6. 由 `E = 0.5 * m * (L / t)^2 / (z * e)` 换算离子能量；
+7. 由法拉第杯电流和 TOF 雅可比估算 `dN/dE`；
+8. 对指定能量范围插值，并用梯形积分计算每周期动能；
+9. 导出 Excel 的 `energy_spectrum` 和 `cycle_summary` 两个 sheet；
+10. 可选上传周期摘要到 InfluxDB/Grafana 数据源。
+
+### Grafana / InfluxDB 配置提示
+
+在 App 的 “Grafana / InfluxDB 上传” 区域填写：
+
+- `URL`：InfluxDB 根地址，例如 `http://localhost:8086`；也可以填写完整 `/api/v2/write` URL。
+- `Org`：InfluxDB v2 organization。
+- `Bucket`：写入 bucket。
+- `Token`：具有写入权限的 InfluxDB token。
+- `Measurement`：默认 `faraday_cup_cycle`。
+
+上传的字段包括 `distance_m`、`peak_index`、`peak_time_s`、`peak_voltage`、`kinetic_energy_mJ`，标签包括 `ion`、`platform`、`cycle`。
+
+### Windows PyQt5 DLL 报错处理
+
+如果运行 `python faraday_cup_app.py` 时出现类似 `ImportError: DLL load failed while importing QtCore`，入口程序会自动回退到 Tkinter 标准库界面，仍可完成 CSV 分析、Excel 导出和 Grafana/InfluxDB 上传。
+
+如需使用带内嵌能谱图的 PyQt/pyqtgraph 界面，请在当前虚拟环境中重新安装 Qt 依赖：
+
+```bash
+python -m pip uninstall -y PyQt5 PyQt5-Qt5 PyQt5-sip pyqtgraph
+python -m pip install PyQt5 pyqtgraph
+```
+
+也可以直接启动兜底界面：
+
+```bash
+python faraday_cup_tk_app.py
+```
