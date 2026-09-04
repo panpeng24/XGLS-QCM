@@ -4,6 +4,7 @@ import csv
 import os
 from datetime import datetime
 from collections import deque
+from bisect import bisect_left
 
 import pandas as pd  # 用于读取 RGA 数据
 
@@ -43,7 +44,8 @@ class QCMWorker(QThread):
     error_signal = pyqtSignal(str)
     log_path_signal = pyqtSignal(str)
 
-    def __init__(self, data_source, is_file_replay, speed=1, save_csv=False, custom_csv_path=""):
+    def __init__(self, data_source, is_file_replay, speed=1, save_csv=False, custom_csv_path="",
+                 replay_interval_ms=0):
         super().__init__()
         self.ds = data_source
         self.is_file_replay = is_file_replay
@@ -53,6 +55,7 @@ class QCMWorker(QThread):
         self.running = True
         self.csv_file = None
         self.csv_writer = None
+        self.replay_interval_ms = replay_interval_ms
 
     def run(self):
         # 1. 初始化 CSV
@@ -120,7 +123,10 @@ class QCMWorker(QThread):
                 if not self.is_file_replay:
                     self.msleep(10)
                 else:
-                    if self.speed < 100: self.msleep(5)
+                    if self.replay_interval_ms > 0:
+                        self.msleep(self.replay_interval_ms)
+                    elif self.speed < 100:
+                        self.msleep(5)
 
             except Exception as e:
                 self.error_signal.emit(str(e))
@@ -345,6 +351,16 @@ class QCMApp(QWidget):
         self.btn_save_img = QPushButton("Screenshot Graph");
         self.btn_save_img.clicked.connect(self.save_plots_as_image)
 
+        self.combo_live_refresh = QComboBox()
+        self.combo_live_refresh.addItem("Live Refresh: 5 seconds", 5_000)
+        self.combo_live_refresh.addItem("Live Refresh: 1 minute", 60_000)
+        self.combo_live_refresh.addItem("Live Refresh: 5 minutes", 300_000)
+        self.combo_live_refresh.addItem("Live Refresh: 30 minutes", 1_800_000)
+        self.combo_live_refresh.setToolTip(
+            "File Replay 模式下每隔所选时间读取一批数据并刷新图表。"
+            "该模式必须选择 CSV 保存文件。"
+        )
+
         self.btn_start = QPushButton("START");
         self.btn_start.setStyleSheet("background: #2e7d32; color: white; padding: 10px; font-weight: bold;")
         self.btn_start.clicked.connect(self.start_experiment)
@@ -359,6 +375,7 @@ class QCMApp(QWidget):
         vb_ctrl.addWidget(self.chk_record);
         vb_ctrl.addWidget(self.widget_csv_path)
         vb_ctrl.addWidget(self.btn_save_img)
+        vb_ctrl.addWidget(self.combo_live_refresh)
         vb_ctrl.addWidget(self.btn_start);
         vb_ctrl.addWidget(self.btn_stop);
         vb_ctrl.addWidget(self.lbl_status)
@@ -407,8 +424,12 @@ class QCMApp(QWidget):
     # ... (常规槽函数保持 V3.7 不变) ...
     def on_source_changed(self, btn):
         sid = self.group_source.checkedId()
-        self.widget_file.setVisible(sid == 2);
+        is_file_replay = sid == 2
+        self.widget_file.setVisible(is_file_replay);
         self.widget_net.setVisible(sid == 3)
+        if is_file_replay:
+            self.chk_record.setChecked(True)
+        self.chk_record.setEnabled(not is_file_replay)
 
     def select_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Log", "", "Txt (*.txt);;All (*)")
@@ -525,6 +546,34 @@ class QCMApp(QWidget):
             pixmap.save(filename)
             QMessageBox.information(self, "Saved", f"Graphs saved to:\n{filename}")
 
+    def _series_for_crosshair(self, prefix):
+        x_data = list(self.abs_time_data) if self.chk_abs_time.isChecked() else list(self.time_data)
+        if prefix == "Freq":
+            y_data = list(self.raw_freq_data) if self.chk_raw_freq.isChecked() else list(self.freq_data)
+            display_prefix = "Raw" if self.chk_raw_freq.isChecked() else "Freq"
+        elif prefix == "Thk":
+            y_data = list(self.thick_data)
+            display_prefix = "Thk"
+        else:
+            y_data = list(self.rate_data)
+            display_prefix = "Rate"
+        return x_data, y_data, display_prefix
+
+    def _nearest_point(self, x_data, y_data, x):
+        if not x_data or not y_data:
+            return None
+        idx = bisect_left(x_data, x)
+        if idx <= 0:
+            nearest = 0
+        elif idx >= len(x_data):
+            nearest = len(x_data) - 1
+        else:
+            before = idx - 1
+            nearest = idx if abs(x_data[idx] - x) < abs(x_data[before] - x) else before
+        if nearest >= len(y_data):
+            return None
+        return nearest, x_data[nearest], y_data[nearest]
+
     def add_crosshair(self, plot, prefix, suffix):
         v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#666', style=Qt.DashLine))
         h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#666', style=Qt.DashLine))
@@ -537,20 +586,23 @@ class QCMApp(QWidget):
             pos = evt[0]
             if plot.sceneBoundingRect().contains(pos):
                 mouse_point = plot.plotItem.vb.mapSceneToView(pos);
-                x, y = mouse_point.x(), mouse_point.y()
-                v_line.setPos(x);
-                h_line.setPos(y)
+                x = mouse_point.x()
+                x_data, y_data, display_prefix = self._series_for_crosshair(prefix)
+                nearest = self._nearest_point(x_data, y_data, x)
+                if nearest is None:
+                    return
+                idx, sample_x, sample_y = nearest
+                v_line.setPos(sample_x);
+                h_line.setPos(sample_y)
                 if self.chk_abs_time.isChecked():
                     try:
-                        t_str = datetime.fromtimestamp(x).strftime("%H:%M:%S")
+                        t_str = datetime.fromtimestamp(sample_x).strftime("%H:%M:%S.%f")[:-3]
                     except:
                         t_str = "Inv"
                 else:
-                    t_str = f"{x:.1f}s"
-                display_prefix = prefix
-                if prefix == "Freq" and self.chk_raw_freq.isChecked(): display_prefix = "Raw"
-                label.setText(f"Time: {t_str}\n{display_prefix}: {y:.2f} {suffix}");
-                label.setPos(x, y)
+                    t_str = f"{sample_x:.6f}s"
+                label.setText(f"Time: {t_str}\n{display_prefix}: {sample_y:.8g} {suffix}\nPoint: {idx + 1}");
+                label.setPos(sample_x, sample_y)
                 v_line.show();
                 h_line.show();
                 label.show()
@@ -560,6 +612,15 @@ class QCMApp(QWidget):
 
     def start_experiment(self):
         src_id = self.group_source.checkedId()
+        if src_id == 2 and not self.input_csv_path.text().strip():
+            QMessageBox.warning(
+                self,
+                "Select Save File",
+                "File Replay 的实时刷新模式需要先选择一个 CSV 保存文件。"
+            )
+            self.select_save_csv()
+            if not self.input_csv_path.text().strip():
+                return
         self.lbl_net_status.setText("Disconnected");
         self.lbl_net_status.setStyleSheet("color: gray")
         self.input_csv_path.setEnabled(False);
@@ -597,10 +658,11 @@ class QCMApp(QWidget):
             self.last_smooth_rate = 0.0
 
             speed = self.spin_speed.value();
-            save_csv = self.chk_record.isChecked();
-            custom_path = self.input_csv_path.text()
+            save_csv = self.chk_record.isChecked() or src_id == 2
+            custom_path = self.input_csv_path.text().strip()
+            replay_interval_ms = self.combo_live_refresh.currentData() if src_id == 2 else 0
             self.worker = QCMWorker(self.ds, is_file_replay=(src_id == 2), speed=speed, save_csv=save_csv,
-                                    custom_csv_path=custom_path)
+                                    custom_csv_path=custom_path, replay_interval_ms=replay_interval_ms)
             self.worker.chunk_signal.connect(self.process_chunk);
             self.worker.finished_signal.connect(self.on_replay_finished)
             self.worker.error_signal.connect(self.on_worker_error);
